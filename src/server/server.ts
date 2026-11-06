@@ -136,6 +136,8 @@ export class GuiServer {
 
     try {
       if (path === "/api/state") return this.state();
+      if (path === "/api/transcript") return this.transcript();
+      if (path === "/api/files") return this.files();
       if (path === "/api/catalog") return json({ presets: PROVIDER_PRESETS });
       if (path === "/api/project/create" && req.method === "POST") return await this.createProjectRoute(req);
       if (path === "/api/project/select" && req.method === "POST") return await this.selectProject(req);
@@ -195,6 +197,38 @@ export class GuiServer {
         unlocked: demo || this.projects.has(p.id),
       })),
     });
+  }
+
+  /**
+   * The active project's stored conversation, as a flat list of render items,
+   * so the GUI can repaint the transcript when you switch back to a tab
+   * (nothing is decrypted to disk — this reads straight from the sealed store).
+   */
+  private transcript(): Response {
+    const u = this.active();
+    if (!u) return json({ items: [] });
+    const items: Array<Record<string, unknown>> = [];
+    for (const m of u.sessions.messages(u.session)) {
+      if (m.role === "user") {
+        const text = m.parts.filter((p) => p.type === "text").map((p) => (p as { text: string }).text).join("\n");
+        if (text.trim()) items.push({ kind: "user", text });
+      } else if (m.role === "assistant") {
+        for (const p of m.parts) {
+          if (p.type === "text" && p.text.trim() && p.text !== "(working…)") items.push({ kind: "ai", text: p.text });
+          else if (p.type === "tool_call") items.push({ kind: "tool_call", tool: p.name, args: p.args });
+        }
+      } else if (m.role === "tool") {
+        for (const p of m.parts) if (p.type === "tool_result") items.push({ kind: "tool_result", ok: !p.isError, output: p.result });
+      }
+    }
+    return json({ items });
+  }
+
+  /** The active project's file paths — powers the composer's @-file picker. */
+  private files(): Response {
+    const u = this.active();
+    if (!u) return json({ files: [] });
+    return json({ files: u.fs.paths().sort() });
   }
 
   // ---- project tabs ---------------------------------------------------------
@@ -436,8 +470,15 @@ export class GuiServer {
     });
   }
 
-  private push(ev: unknown): void {
-    this.sse?.enqueue(this.encoder.encode(`data: ${JSON.stringify(ev)}\n\n`));
+  /**
+   * Emit an SSE event. When `pid` is given the event is tagged with the
+   * project it belongs to, so the single browser stream can ignore events
+   * from a turn running on a project the user has since switched away from
+   * (the final result is still persisted and replayed on switch-back).
+   */
+  private push(ev: Record<string, unknown>, pid?: string): void {
+    const payload = pid ? { ...ev, project: pid } : ev;
+    this.sse?.enqueue(this.encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
   }
 
   private async message(req: Request): Promise<Response> {
@@ -463,6 +504,7 @@ export class GuiServer {
   // ---- the turn -------------------------------------------------------------
 
   private async runTurn(u: Unlocked, text: string): Promise<void> {
+    const pid = u.id;
     try {
       const rev = u.config.reviewer;
       const loopOn = Boolean(rev?.enabled && rev?.prompt && rev.prompt.trim());
@@ -473,14 +515,14 @@ export class GuiServer {
 
       for (let round = 1; round <= maxRounds; round++) {
         const result = await this.runWorkerTurn(u, userText);
-        this.pushFinal(result);
+        this.pushFinal(result, pid);
         if (!loopOn) break;
 
         if (round >= maxRounds) {
-          this.push({ type: "note", text: `Loop: reached the ${maxRounds}-round limit — stopping.` });
+          this.push({ type: "note", text: `Loop: reached the ${maxRounds}-round limit — stopping.` }, pid);
           break;
         }
-        this.push({ type: "note", text: `Reviewer is checking the work (round ${round})…` });
+        this.push({ type: "note", text: `Reviewer is checking the work (round ${round})…` }, pid);
         const evidence = summarizeTrace(result.trace);
         const endMessage = result.finalText.trim() || result.finalReasoning?.trim() || "(the worker produced no answer)";
         const reviewerModel = (rev!.model && rev!.model.trim()) || u.model;
@@ -488,37 +530,38 @@ export class GuiServer {
         try {
           review = await runReview(u.provider, reviewerModel, { review: rev!.prompt!, mission, endMessage, evidence, round, maxRounds });
         } catch (e) {
-          this.push({ type: "note", text: `Reviewer error: ${(e as Error).message} — stopping the loop.` });
+          this.push({ type: "note", text: `Reviewer error: ${(e as Error).message} — stopping the loop.` }, pid);
           break;
         }
         const v = review.verdict;
-        this.push({ type: "reviewer", verdict: v?.verdict ?? "unclear", reason: v?.reason ?? review.raw.slice(0, 500), instruction: v && v.verdict === "continue" ? v.instruction : undefined });
-        if (!v) { this.push({ type: "note", text: "Reviewer gave no usable verdict — stopping the loop." }); break; }
-        if (v.verdict === "done") { this.push({ type: "note", text: `Reviewer approved the work — loop complete.` }); break; }
-        if (v.verdict === "blocked") { this.push({ type: "note", text: `Reviewer paused the loop (needs you): ${v.reason}` }); break; }
+        this.push({ type: "reviewer", verdict: v?.verdict ?? "unclear", reason: v?.reason ?? review.raw.slice(0, 500), instruction: v && v.verdict === "continue" ? v.instruction : undefined }, pid);
+        if (!v) { this.push({ type: "note", text: "Reviewer gave no usable verdict — stopping the loop." }, pid); break; }
+        if (v.verdict === "done") { this.push({ type: "note", text: `Reviewer approved the work — loop complete.` }, pid); break; }
+        if (v.verdict === "blocked") { this.push({ type: "note", text: `Reviewer paused the loop (needs you): ${v.reason}` }, pid); break; }
         // continue — guard against spinning on the same unresolved reason.
-        if (v.reason && v.reason === lastReason) { this.push({ type: "note", text: "No progress since the last round — stopping the loop." }); break; }
+        if (v.reason && v.reason === lastReason) { this.push({ type: "note", text: "No progress since the last round — stopping the loop." }, pid); break; }
         lastReason = v.reason;
         userText = v.instruction;
       }
     } catch (err) {
-      if (err instanceof AgentLoopError) this.push({ type: "error", text: `stopped (${err.reason}): ${err.message}` });
+      if (err instanceof AgentLoopError) this.push({ type: "error", text: `stopped (${err.reason}): ${err.message}` }, pid);
       else if (err instanceof ProviderError) {
         const r = resolveProvider(u.config);
-        this.push({ type: "error", text: r ? friendlyProviderError(err, r.provider) : (err as Error).message });
-      } else this.push({ type: "error", text: (err as Error).message });
+        this.push({ type: "error", text: r ? friendlyProviderError(err, r.provider) : (err as Error).message }, pid);
+      } else this.push({ type: "error", text: (err as Error).message }, pid);
     } finally {
-      this.push({ type: "turn_done" });
+      this.push({ type: "turn_done" }, pid);
     }
   }
 
   /** One worker turn: add the user message, compress, run the agent, persist. */
   private async runWorkerTurn(u: Unlocked, text: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
     u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
+    const pid = u.id;
     const compressed = await compressHistory(u.sessions.messages(u.session), u.draft, text, u.config.focus);
     if (compressed.report.triggered) {
       const r = compressed.report;
-      this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` });
+      this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` }, pid);
     }
     const result = await runAgent({
       provider: u.provider,
@@ -529,11 +572,11 @@ export class GuiServer {
       ctx: u.ctx,
       diagnostics: u.diagnostics,
       onEvent: (e) => {
-        if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text });
-        else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text });
-        else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args });
-        else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output });
-        else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text });
+        if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text }, pid);
+        else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text }, pid);
+        else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args }, pid);
+        else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output }, pid);
+        else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text }, pid);
       },
     });
     for (const entry of result.trace) {
@@ -553,25 +596,26 @@ export class GuiServer {
   }
 
   /** Render the worker's final answer (or the reasoning-only / empty cases). */
-  private pushFinal(result: Awaited<ReturnType<typeof runAgent>>): void {
+  private pushFinal(result: Awaited<ReturnType<typeof runAgent>>, pid?: string): void {
     const finalText = result.finalText.trim();
-    if (finalText) this.push({ type: "assistant_final", text: finalText });
+    if (finalText) this.push({ type: "assistant_final", text: finalText }, pid);
     else if (result.finalReasoning && result.finalReasoning.trim())
-      this.push({ type: "assistant_final", text: "", reasoningOnly: true });
-    else this.push({ type: "assistant_final", text: "(no response — the model returned nothing; try again or switch models)", note: true });
+      this.push({ type: "assistant_final", text: "", reasoningOnly: true }, pid);
+    else this.push({ type: "assistant_final", text: "(no response — the model returned nothing; try again or switch models)", note: true }, pid);
   }
 
   private requestPermission(action: string, detail: string): Promise<boolean> {
+    const pid = this.active()?.id;
     // Auto mode (opencode-style): approve without prompting, but still surface
     // what was allowed so nothing happens invisibly.
     if (this.active()?.config.permissionMode === "auto") {
-      this.push({ type: "note", text: `auto-allowed ${action}: ${detail}` });
+      this.push({ type: "note", text: `auto-allowed ${action}: ${detail}` }, pid);
       return Promise.resolve(true);
     }
     return new Promise<boolean>((resolve) => {
       const id = newId("perm");
       this.pending.set(id, resolve);
-      this.push({ type: "permission", id, action, detail });
+      this.push({ type: "permission", id, action, detail }, pid);
     });
   }
 

@@ -95,6 +95,24 @@ test("a message runs the agent and streams the answer back over SSE", async () =
   expect(final.text).toContain("demo mode");
   expect(final.text).toContain("hello there");
   expect(events.some((e) => e.type === "turn_done")).toBe(true);
+  // Every turn event is tagged with the project it ran on, so the browser can
+  // ignore events from a tab the user switched away from.
+  expect(final.project).toBe("demo");
+  expect(events.find((e) => e.type === "turn_done").project).toBe("demo");
+
+  // The stored conversation is replayable (transcript restore on tab switch).
+  const t = (await fetch(`${base}/api/transcript`, { headers: auth() }).then((r) => r.json())) as any;
+  expect(Array.isArray(t.items)).toBe(true);
+  expect(t.items.some((i: any) => i.kind === "user" && i.text.includes("hello there"))).toBe(true);
+  expect(t.items.some((i: any) => i.kind === "ai" && i.text.includes("demo mode"))).toBe(true);
+});
+
+test("the files route returns an array (powers the @-file picker)", async () => {
+  const r = await fetch(`${base}/api/files`, { headers: auth() });
+  expect(r.status).toBe(200);
+  const data = (await r.json()) as any;
+  expect(Array.isArray(data.files)).toBe(true);
+  expect((await fetch(`${base}/api/files`)).status).toBe(403);
 });
 
 async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {

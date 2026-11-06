@@ -657,6 +657,8 @@ function startChat(info) {
     messages.innerHTML = ""; think = null; liveBubble = null;
     $("modelSelect").innerHTML = "";
     shownProject = info.activeProject;
+    fileCache = null; // @-file list is per project
+    loadTranscript(); // repaint this project's stored conversation
   }
   applyHeader(info);
   setStatus("ready");
@@ -836,6 +838,90 @@ function addReviewer(e) {
   messages.appendChild(d); scrollDown();
 }
 
+// ---- transcript restore ----------------------------------------------------
+function renderTranscriptItems(items) {
+  for (const it of items) {
+    if (it.kind === "user") addBubble("user", it.text);
+    else if (it.kind === "ai") addBubble("ai", it.text);
+    else if (it.kind === "tool_call") addEvent('⚙ <span class="tname">' + esc(it.tool) + '</span> <span class="chip">' + esc(JSON.stringify(it.args).slice(0, 100)) + '</span>', "");
+    else if (it.kind === "tool_result") addEvent('<span class="chip ' + (it.ok ? "" : "err") + '">⤷ ' + (it.ok ? "ok" : "err") + ": " + esc((it.output || "").split("\n")[0].slice(0, 120)) + "</span>", "");
+  }
+  scrollDown();
+}
+async function loadTranscript() {
+  try {
+    const r = await api("/api/transcript").then((r) => r.json());
+    if (r.items && r.items.length) renderTranscriptItems(r.items);
+  } catch {}
+}
+
+// ---- @-file picker ---------------------------------------------------------
+let fileCache = null;         // [paths] for the active project, lazily fetched
+let fileMenu = null;          // the dropdown element while open
+let fileMenuIdx = 0;          // highlighted row
+async function ensureFiles() {
+  if (fileCache) return fileCache;
+  try { fileCache = (await api("/api/files").then((r) => r.json())).files || []; }
+  catch { fileCache = []; }
+  return fileCache;
+}
+function closeFileMenu() { if (fileMenu) { fileMenu.remove(); fileMenu = null; } }
+// The @token immediately left of the cursor, or null.
+function atToken(el) {
+  const pos = el.selectionStart;
+  const left = el.value.slice(0, pos);
+  const m = left.match(/(^|\s)@([^\s@]*)$/);
+  if (!m) return null;
+  return { query: m[2], start: pos - m[2].length };
+}
+async function maybeFileMenu() {
+  const el = $("input");
+  const tok = atToken(el);
+  if (!tok) return closeFileMenu();
+  const files = await ensureFiles();
+  const q = tok.query.toLowerCase();
+  const hits = files.filter((f) => f.toLowerCase().includes(q)).slice(0, 8);
+  if (!hits.length) return closeFileMenu();
+  if (!fileMenu) {
+    fileMenu = document.createElement("div");
+    fileMenu.id = "fileMenu";
+    fileMenu.style.cssText = "position:absolute;bottom:100%;left:0;margin-bottom:6px;z-index:40;min-width:260px;max-width:min(90vw,460px);background:#0d0f16;border:1px solid var(--border);border-radius:11px;box-shadow:0 12px 34px rgba(0,0,0,.5);overflow:hidden";
+    const anchor = $("composer");
+    anchor.style.position = anchor.style.position || "relative";
+    anchor.appendChild(fileMenu);
+  }
+  fileMenuIdx = Math.min(fileMenuIdx, hits.length - 1);
+  fileMenu.dataset.hits = JSON.stringify(hits);
+  fileMenu.dataset.start = String(tok.start);
+  fileMenu.innerHTML = hits.map((f, i) =>
+    '<div class="fm-row" data-i="' + i + '" style="padding:8px 12px;cursor:pointer;font:13px var(--mono,monospace);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' +
+    (i === fileMenuIdx ? "background:var(--accent);color:#06121f" : "color:var(--text)") + '">' + esc(f) + "</div>"
+  ).join("");
+  fileMenu.querySelectorAll(".fm-row").forEach((row) => {
+    row.addEventListener("mousedown", (e) => { e.preventDefault(); pickFile(hits[Number(row.dataset.i)], tok.start); });
+  });
+}
+function pickFile(path, start) {
+  const el = $("input");
+  const pos = el.selectionStart;
+  el.value = el.value.slice(0, start) + path + " " + el.value.slice(pos);
+  const caret = start + path.length + 1;
+  el.setSelectionRange(caret, caret);
+  closeFileMenu();
+  el.focus();
+}
+// true if the keydown was consumed by the file menu.
+function fileMenuKey(e) {
+  if (!fileMenu) return false;
+  const hits = JSON.parse(fileMenu.dataset.hits || "[]");
+  const start = Number(fileMenu.dataset.start);
+  if (e.key === "ArrowDown") { fileMenuIdx = (fileMenuIdx + 1) % hits.length; e.preventDefault(); maybeFileMenu(); return true; }
+  if (e.key === "ArrowUp") { fileMenuIdx = (fileMenuIdx - 1 + hits.length) % hits.length; e.preventDefault(); maybeFileMenu(); return true; }
+  if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pickFile(hits[fileMenuIdx], start); return true; }
+  if (e.key === "Escape") { e.preventDefault(); closeFileMenu(); return true; }
+  return false;
+}
+
 let eventSource = null;
 function connectEvents() {
   if (eventSource) return; // one shared stream for the whole GUI
@@ -843,6 +929,10 @@ function connectEvents() {
   eventSource = es;
   es.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
+    // A turn is tagged with the project it runs on; ignore live events from a
+    // project the user has switched away from (its final result is persisted
+    // and replayed from the store when they switch back).
+    if (e.project && e.project !== shownProject) return;
     if (e.type === "note") addEvent(esc(e.text), "note");
     else if (e.type === "reviewer") { hideTyping(); addReviewer(e); showTyping(); }
     else if (e.type === "reasoning") { appendThink(e.text); }
@@ -865,7 +955,7 @@ function connectEvents() {
       }
     }
     else if (e.type === "error") { hideTyping(); finalizeLive(); addEvent("✖ " + esc(e.text), "errline"); }
-    else if (e.type === "turn_done") { busy = false; hideTyping(); endThink(); finalizeLive(); setStatus("ready"); $("sendBtn").disabled = false; }
+    else if (e.type === "turn_done") { busy = false; hideTyping(); endThink(); finalizeLive(); setStatus("ready"); $("sendBtn").disabled = false; fileCache = null; }
     else if (e.type === "permission") showPermission(e);
   };
   es.onerror = () => setStatus("reconnecting…");
@@ -873,11 +963,14 @@ function connectEvents() {
 
 $("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
 $("input").addEventListener("keydown", (e) => {
+  if (fileMenuKey(e)) return; // the @-file menu swallows nav/enter/esc keys
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("input").addEventListener("input", (e) => {
   e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 180) + "px";
+  maybeFileMenu();
 });
+$("input").addEventListener("blur", () => setTimeout(closeFileMenu, 120));
 
 async function send() {
   const text = $("input").value.trim();
