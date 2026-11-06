@@ -92,15 +92,42 @@ A **reviewer loop** (the **Loop** pill above the composer) runs a second agent
 that reviews each turn against your mission and feeds a concrete correction back
 to the worker — catching mistakes and goal drift automatically — until it
 approves or hits the round limit. Arm it with a review instruction (and an
-optional separate reviewer model); reviewer verdicts (continue / done / blocked)
-show inline as you watch it self-correct.
+optional separate reviewer model, a pass/fail **criteria rubric**, and a
+**verifier check** command like `bun test` that's run after each turn and fed
+back on failure); reviewer verdicts (continue / done / blocked) show inline as
+you watch it self-correct.
+
+More of what's built:
+
+- **Conversations persist.** Each project resumes its last session on restart,
+  and switching tabs repaints the transcript straight from the sealed store.
+- **Undo.** AnonCode checkpoints the project (encrypted, content-addressed,
+  deduplicated) before each change; **Settings → History → Undo** walks back a
+  turn at a time. Nothing is decrypted to disk.
+- **Project memory (Reflexion).** Corrections the reviewer makes are distilled
+  into durable lessons, sealed in the vault, and injected into later turns so
+  the agent stops repeating mistakes. Manage them in **Settings → Project
+  memory**.
+- **Local semantic search.** A `search` tool (and `@`-file picker) finds
+  relevant code by on-device similarity — no embeddings API, nothing leaves the
+  machine.
+- **Best-of-N.** Generate several isolated candidate attempts per turn and keep
+  the one a judge picks (losers are rolled back). **Settings → Best-of-N.**
+- **Native tool-calling.** Opt into the provider's function-calling for strong
+  models, or keep the portable fenced-text protocol for weak/local ones
+  (**Settings → Tool calling**).
+- **FOCUS fidelity.** Context compression protects every user instruction, and
+  you can switch between the offline heuristic and the paper's model-backed
+  draft + defensive review (**Settings → Context compression**).
 
 A **settings panel** (gear, top-right) lets you switch model/provider, flip
 between **Build** (can edit/run) and **Plan** (read-only) mode, choose a
 **permission mode** — **Ask** (prompt each time) or **Auto** (approve
-automatically, opencode-style) — **export** the decrypted project to a folder,
-or **lock** the vault — all without leaving the chat. It closes only with the ✕
-or **Escape** (an outside click won't dismiss it).
+automatically, opencode-style) — pick the **tool-calling** and **context
+compression** modes, set **Best-of-N**, manage **project memory**, **undo** the
+last change, **export** the decrypted project to a folder, or **lock** the vault
+— all without leaving the chat. It closes only with the ✕ or **Escape** (an
+outside click won't dismiss it).
 
 ## Requirements
 
