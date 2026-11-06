@@ -75,7 +75,11 @@ export async function runAgent(opts: {
     guard.beginStep();
     const res = await generateOnce(opts.provider, opts.model, opts.system, convo, limits, opts.maxTokens, opts.onEvent);
 
-    const call = parseToolCall(res.text);
+    // Some models emit the tool call inside their reasoning and leave the
+    // visible answer empty. Fall back to the reasoning only when the answer has
+    // no call of its own, so a real final reply is never overridden.
+    let call = parseToolCall(res.text);
+    if (!call && !res.text.trim() && res.reasoning) call = parseToolCall(res.reasoning);
     trace.push({ kind: "assistant", text: res.text, call: call ?? undefined });
     if (!call) {
       guard.recordProgress(`final:${hash(res.text)}`);

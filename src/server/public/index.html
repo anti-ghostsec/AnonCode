@@ -949,6 +949,13 @@ function addReviewer(e) {
 function renderTranscriptItems(items) {
   for (const it of items) {
     if (it.kind === "user") addBubble("user", it.text);
+    else if (it.kind === "reasoning") {
+      const d = document.createElement("details");
+      d.className = "think";
+      d.innerHTML = '<summary><span class="chev">▸</span> <span class="tlabel">thoughts</span></summary><div class="tbody"></div>';
+      d.querySelector(".tbody").textContent = it.text;
+      messages.appendChild(d);
+    }
     else if (it.kind === "ai") addBubble("ai", it.text);
     else if (it.kind === "tool_call") addEvent('⚙ <span class="tname">' + esc(it.tool) + '</span> <span class="chip">' + esc(JSON.stringify(it.args).slice(0, 100)) + '</span>', "");
     else if (it.kind === "tool_result") addEvent('<span class="chip ' + (it.ok ? "" : "err") + '">⤷ ' + (it.ok ? "ok" : "err") + ": " + esc((it.output || "").split("\n")[0].slice(0, 120)) + "</span>", "");

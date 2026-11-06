@@ -2,6 +2,7 @@ export type Role = "system" | "user" | "assistant" | "tool";
 
 export type ContentPart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | { type: "image"; mime: string; dataB64: string; filename?: string }
   | { type: "tool_call"; id: string; name: string; args: unknown }
   | { type: "tool_result"; id: string; result: string; isError?: boolean };

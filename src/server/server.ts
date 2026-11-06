@@ -241,7 +241,8 @@ export class GuiServer {
         if (text.trim()) items.push({ kind: "user", text });
       } else if (m.role === "assistant") {
         for (const p of m.parts) {
-          if (p.type === "text" && p.text.trim() && p.text !== "(working…)") items.push({ kind: "ai", text: p.text });
+          if (p.type === "reasoning" && p.text.trim()) items.push({ kind: "reasoning", text: p.text });
+          else if (p.type === "text" && p.text.trim() && p.text !== "(working…)") items.push({ kind: "ai", text: p.text });
           else if (p.type === "tool_call") items.push({ kind: "tool_call", tool: p.name, args: p.args });
         }
       } else if (m.role === "tool") {
@@ -636,6 +637,7 @@ export class GuiServer {
       let lastReason = "";
 
       const bestOf = Math.min(Math.max(u.config.bestOf ?? 1, 1), 5);
+      let lastVerifierOutput = "";
       for (let round = 1; round <= maxRounds; round++) {
         const result = await this.runBestOfWorker(u, userText, bestOf, pid);
         this.pushFinal(result, pid);
@@ -648,8 +650,20 @@ export class GuiServer {
           const vr = await runVerifier(cmd, u.runspace.dir);
           this.push({ type: "verifier", ok: vr.ok, output: vr.output.slice(0, 1500) }, pid);
           if (!vr.ok) {
+            // A check that can't even run is a broken setting, not a code bug —
+            // don't ask the worker to "fix" it (it will try to fake it).
+            if (vr.couldNotRun) {
+              this.push({ type: "note", text: `The check command "${cmd}" couldn't run (not found or not executable). Fix it in the Loop settings — stopping so the worker doesn't try to work around it.` }, pid);
+              break;
+            }
+            // Identical failure twice running = no progress; stop the loop.
+            if (vr.output === lastVerifierOutput) {
+              this.push({ type: "note", text: "Checks are failing the same way as last round — stopping instead of looping." }, pid);
+              break;
+            }
+            lastVerifierOutput = vr.output;
             if (round >= maxRounds) { this.push({ type: "note", text: "Checks still failing — reached the round limit." }, pid); break; }
-            this.push({ type: "note", text: "Checks failed — asking the worker to fix them." }, pid);
+            this.push({ type: "note", text: "Checks failed — asking the worker to fix the code." }, pid);
             userText = verifierFeedback(cmd, vr.output);
             continue; // back to the worker, skipping the reviewer this round
           }
@@ -745,6 +759,10 @@ export class GuiServer {
       if (entry.kind === "assistant") {
         const prose = stripToolBlock(entry.text);
         const parts: ContentPart[] = [];
+        // The terminal assistant entry (no tool call) carries the final answer;
+        // attach the final reasoning so the thinking panel survives a refresh.
+        if (!entry.call && result.finalReasoning && result.finalReasoning.trim())
+          parts.push({ type: "reasoning", text: result.finalReasoning });
         if (prose) parts.push({ type: "text", text: prose });
         if (entry.call) parts.push({ type: "tool_call", id: newId("call"), name: entry.call.tool, args: entry.call.args });
         if (parts.length === 0) parts.push({ type: "text", text: "(working…)" });

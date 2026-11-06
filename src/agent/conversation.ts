@@ -26,6 +26,9 @@ export function toProviderMessages(messages: Message[]): ProviderMessage[] {
     for (const p of m.parts) {
       if (p.type === "text") {
         if (p.text) content.push({ type: "text", text: p.text });
+      } else if (p.type === "reasoning") {
+        // Stored for display/restore only; never resent to the model as input.
+        continue;
       } else if (p.type === "image") {
         content.push({ type: "image", mime: p.mime, dataB64: p.dataB64, filename: p.filename });
       } else if (p.type === "tool_call") {

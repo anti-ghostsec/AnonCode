@@ -28,6 +28,17 @@ class ScriptedProvider implements Provider {
   }
 }
 
+/** Returns explicit {text, reasoning} pairs, to exercise the reasoning path. */
+class ReasoningProvider implements Provider {
+  readonly name = "reasoning";
+  private i = 0;
+  constructor(private responses: Array<{ text: string; reasoning?: string }>) {}
+  async generate(): Promise<GenerateResult> {
+    const r = this.responses[Math.min(this.i++, this.responses.length - 1)]!;
+    return { text: r.text, reasoning: r.reasoning };
+  }
+}
+
 class QueueDiagnostics implements DiagnosticsProvider {
   private i = 0;
   constructor(private q: string[]) {}
@@ -108,4 +119,50 @@ test("plan mode exposes no mutating tools", async () => {
   expect(names).not.toContain("edit");
   expect(names).not.toContain("bash");
   expect(names).toContain("read");
+});
+
+test("executes a tool call emitted as <tool> tags, not just fenced blocks", async () => {
+  // The reported bug: `read` was emitted as <tool>…</tool> and never ran.
+  const provider = new ScriptedProvider([
+    '<tool>\n{"tool":"write","args":{"path":"a.txt","content":"hi"}}\n</tool>',
+    "done",
+  ]);
+  const c = ctx();
+  const result = await runAgent({
+    provider, model: "m", system: "sys",
+    messages: [{ role: "user", content: [{ type: "text", text: "write a file" }] }],
+    registry: defaultTools("build"), ctx: c,
+  });
+  expect(result.toolCalls).toBe(1);
+  expect(c.fs.read("a.txt")?.toString()).toBe("hi");
+  expect(result.finalText).toBe("done");
+});
+
+test("falls back to a tool call hidden in reasoning when the answer is empty", async () => {
+  // The reported bug: the model put its whole response (incl. the tool call)
+  // in reasoning, leaving the visible answer empty, so nothing ran.
+  const provider = new ReasoningProvider([
+    { text: "", reasoning: '<tool>{"tool":"ls","args":{}}</tool>' },
+    { text: "here is the listing" },
+  ]);
+  const result = await runAgent({
+    provider, model: "m", system: "sys",
+    messages: [{ role: "user", content: [{ type: "text", text: "list" }] }],
+    registry: defaultTools("build"), ctx: ctx(),
+  });
+  expect(result.toolCalls).toBe(1);
+  expect(result.finalText).toBe("here is the listing");
+});
+
+test("a real answer in reasoning is NOT hijacked when the text has a final reply", async () => {
+  const provider = new ReasoningProvider([
+    { text: "All done, no tools needed.", reasoning: 'I could {"tool":"ls","args":{}} but won\'t' },
+  ]);
+  const result = await runAgent({
+    provider, model: "m", system: "sys",
+    messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    registry: defaultTools("build"), ctx: ctx(),
+  });
+  expect(result.toolCalls).toBe(0);
+  expect(result.finalText).toBe("All done, no tools needed.");
 });
