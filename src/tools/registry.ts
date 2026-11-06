@@ -1,6 +1,7 @@
 import type { Tool, ToolContext, ToolResult } from "./types.ts";
 import { readTool, writeTool, editTool, lsTool, globTool, grepTool } from "./fs.ts";
 import { bashTool } from "./bash.ts";
+import { searchTool } from "./search.ts";
 
 export class ToolRegistry {
   private tools = new Map<string, Tool>();
@@ -30,6 +31,6 @@ export class ToolRegistry {
 
 /** The default build toolset. `plan` mode omits the mutating/running tools. */
 export function defaultTools(mode: "build" | "plan" = "build"): ToolRegistry {
-  if (mode === "plan") return new ToolRegistry([readTool, lsTool, globTool, grepTool]);
-  return new ToolRegistry([readTool, writeTool, editTool, lsTool, globTool, grepTool, bashTool]);
+  if (mode === "plan") return new ToolRegistry([readTool, lsTool, globTool, grepTool, searchTool]);
+  return new ToolRegistry([readTool, writeTool, editTool, lsTool, globTool, grepTool, searchTool, bashTool]);
 }

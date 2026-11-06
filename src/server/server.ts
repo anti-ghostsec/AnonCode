@@ -26,6 +26,7 @@ import { EncryptedFS } from "../vfs/efs.ts";
 import { Runspace } from "../vfs/runspace.ts";
 import { SnapshotStore } from "../vfs/snapshots.ts";
 import { MemoryStore } from "../agent/memory.ts";
+import { SemanticSearch } from "../search/semantic.ts";
 import { defaultTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolContext } from "../tools/types.ts";
 import { NoDiagnostics, CommandDiagnostics, type DiagnosticsProvider } from "../tools/diagnostics.ts";
@@ -143,6 +144,7 @@ export class GuiServer {
       if (path === "/api/state") return this.state();
       if (path === "/api/transcript") return this.transcript();
       if (path === "/api/files") return this.files();
+      if (path === "/api/search") return await this.searchRoute(url);
       if (path === "/api/catalog") return json({ presets: PROVIDER_PRESETS });
       if (path === "/api/project/create" && req.method === "POST") return await this.createProjectRoute(req);
       if (path === "/api/project/select" && req.method === "POST") return await this.selectProject(req);
@@ -251,6 +253,16 @@ export class GuiServer {
     const u = this.active();
     if (!u) return json({ files: [] });
     return json({ files: u.fs.paths().sort() });
+  }
+
+  /** Local semantic search over the active project (on-device, nothing leaves). */
+  private async searchRoute(url: URL): Promise<Response> {
+    const u = this.active();
+    if (!u) return json({ hits: [] });
+    const q = (url.searchParams.get("q") ?? "").trim();
+    if (!q) return json({ hits: [] });
+    const hits = await new SemanticSearch().search(u.fs, q, 10);
+    return json({ hits });
   }
 
   // ---- project tabs ---------------------------------------------------------
