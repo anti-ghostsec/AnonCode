@@ -26,6 +26,11 @@ export type AppConfig = {
   imageLimits?: Partial<ProviderImageLimits>;
   /** FOCUS context-compression overrides; defaults apply when omitted. */
   focus?: Partial<FocusOptions>;
+  /** Which FOCUS draft model to use: "heuristic" (offline, default — rule-based
+   * defensive floor only) or "model" (uses the provider for the paper's
+   * Monte-Carlo citation + defensive review; higher fidelity, costs extra
+   * model calls when compression triggers). */
+  focusDraft?: "heuristic" | "model";
   /** "build" (default) or "plan" (read-only tools). */
   agentMode?: "build" | "plan";
   /** How tool permissions are handled: "ask" (default — prompt each time) or
@@ -43,6 +48,8 @@ export type AppConfig = {
     enabled?: boolean;
     /** Stable reviewer instruction (what to check for). */
     prompt?: string;
+    /** Optional explicit pass/fail criteria (one per line); 'done' needs all. */
+    rubric?: string;
     /** Optional mission override; when absent, the user's request is used. */
     mission?: string;
     /** Optional model for the reviewer (same provider); defaults to the worker's. */

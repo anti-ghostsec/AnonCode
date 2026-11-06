@@ -30,7 +30,7 @@ import { defaultTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolContext } from "../tools/types.ts";
 import { NoDiagnostics, CommandDiagnostics, type DiagnosticsProvider } from "../tools/diagnostics.ts";
 import { LspDiagnostics } from "../lsp/diagnostics.ts";
-import { HeuristicDraftModel } from "../context/draft.ts";
+import { HeuristicDraftModel, ModelDraftModel } from "../context/draft.ts";
 import { compressHistory } from "../context/index.ts";
 import { toProviderMessages } from "../agent/conversation.ts";
 import { buildAgentPrompt } from "../agent/prompt.ts";
@@ -192,9 +192,11 @@ export class GuiServer {
       baseUrl: current?.provider.baseUrl ?? null,
       mode: u?.mode ?? "build",
       permissionMode: u?.config.permissionMode ?? "ask",
+      focusDraft: u?.config.focusDraft ?? "heuristic",
       reviewer: {
         enabled: Boolean(u?.config.reviewer?.enabled),
         prompt: u?.config.reviewer?.prompt ?? "",
+        rubric: u?.config.reviewer?.rubric ?? "",
         mission: u?.config.reviewer?.mission ?? "",
         model: u?.config.reviewer?.model ?? "",
         maxRounds: u?.config.reviewer?.maxRounds ?? 4,
@@ -392,7 +394,7 @@ export class GuiServer {
     const u = this.active();
     if (!u) return json({ error: "locked" }, 401);
     if (this.opts.demo) return this.state();
-    const { mode, permissionMode, memory } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean };
+    const { mode, permissionMode, memory, focusDraft } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean; focusDraft?: string };
     if (mode !== undefined) {
       if (mode !== "build" && mode !== "plan") return json({ error: "mode must be build or plan" }, 400);
       u.config.agentMode = mode;
@@ -404,6 +406,10 @@ export class GuiServer {
       u.config.permissionMode = permissionMode;
     }
     if (memory !== undefined) u.config.memory = { enabled: Boolean(memory) };
+    if (focusDraft !== undefined) {
+      if (focusDraft !== "heuristic" && focusDraft !== "model") return json({ error: "focusDraft must be heuristic or model" }, 400);
+      u.config.focusDraft = focusDraft;
+    }
     saveConfig(u.store, u.config);
     return this.state();
   }
@@ -413,13 +419,14 @@ export class GuiServer {
     if (!u) return json({ error: "locked" }, 401);
     if (this.opts.demo) return this.state();
     const body = (await req.json().catch(() => ({}))) as {
-      enabled?: boolean; prompt?: string; mission?: string; model?: string; maxRounds?: number;
+      enabled?: boolean; prompt?: string; rubric?: string; mission?: string; model?: string; maxRounds?: number;
     };
     const prompt = (body.prompt ?? "").trim();
     if (body.enabled && !prompt) return json({ error: "a reviewer instruction is required to arm the loop" }, 400);
     u.config.reviewer = {
       enabled: Boolean(body.enabled),
       prompt: prompt || undefined,
+      rubric: (body.rubric ?? "").trim() || undefined,
       mission: (body.mission ?? "").trim() || undefined,
       model: (body.model ?? "").trim() || undefined,
       maxRounds: body.maxRounds ? Math.min(Math.max(Math.round(body.maxRounds), 1), 50) : undefined,
@@ -643,7 +650,7 @@ export class GuiServer {
         const reviewerModel = (rev!.model && rev!.model.trim()) || u.model;
         let review: { verdict?: Verdict; raw: string };
         try {
-          review = await runReview(u.provider, reviewerModel, { review: rev!.prompt!, mission, endMessage, evidence, round, maxRounds });
+          review = await runReview(u.provider, reviewerModel, { review: rev!.prompt!, rubric: rev!.rubric, mission, endMessage, evidence, round, maxRounds });
         } catch (e) {
           this.push({ type: "note", text: `Reviewer error: ${(e as Error).message} — stopping the loop.` }, pid);
           break;
@@ -679,7 +686,11 @@ export class GuiServer {
   private async runWorkerTurn(u: Unlocked, text: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
     u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
     const pid = u.id;
-    const compressed = await compressHistory(u.sessions.messages(u.session), u.draft, text, u.config.focus);
+    // FOCUS draft model: the offline heuristic (rule-based defensive floor) by
+    // default, or the model-backed draft (the paper's Monte-Carlo citation +
+    // defensive review) when the user opts in — so both can be compared.
+    const draft = u.config.focusDraft === "model" ? new ModelDraftModel(u.provider, u.model) : u.draft;
+    const compressed = await compressHistory(u.sessions.messages(u.session), draft, text, u.config.focus);
     if (compressed.report.triggered) {
       const r = compressed.report;
       this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` }, pid);

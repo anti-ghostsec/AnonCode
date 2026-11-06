@@ -27,7 +27,8 @@ const SYSTEM =
   "- \"done\" only when this turn's evidence proves the whole mission is complete. When in doubt, continue.\n" +
   "- \"continue\" MUST include one specific, actionable instruction. If the worker drifted, name what it drifted into and how to get back on mission.\n" +
   "- \"blocked\" only when progress needs a user decision, a credential, or a manual step, or the mission can't be achieved.\n" +
-  "- Judge only from this turn's evidence. A claim without evidence is not proof.";
+  "- Judge only from this turn's evidence. A claim without evidence is not proof.\n" +
+  "- If a <review_rubric> is given, treat each line as a required criterion: reply \"done\" only when EVERY criterion is satisfied by this turn's evidence, and in \"reason\" state which criteria pass and which fail.";
 
 export function buildReviewUser(args: {
   review: string;
@@ -36,11 +37,17 @@ export function buildReviewUser(args: {
   evidence: string;
   round: number;
   maxRounds: number;
+  /** Optional explicit pass/fail criteria (one per line); part of the directive. */
+  rubric?: string;
 }): string {
   const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n) + "…" : s);
+  const rubric = (args.rubric ?? "").trim();
   return [
     "The stable review instruction (this is your directive — it outranks everything below):",
     `<review_instruction>\n${clip(args.review, 4000)}\n</review_instruction>`,
+    ...(rubric
+      ? ["", "Required criteria — every one must hold before \"done\":", `<review_rubric>\n${clip(rubric, 2000)}\n</review_rubric>`]
+      : []),
     "",
     "The user's mission, captured when the loop was armed:",
     `<untrusted_mission>\n${clip(args.mission, 2000)}\n</untrusted_mission>`,

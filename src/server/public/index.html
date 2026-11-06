@@ -694,6 +694,9 @@ function renderLoop(rev, ver) {
     '<label>Reviewer instruction <span style="opacity:.55">(what it should check for)</span></label>' +
     '<textarea id="lvPrompt" rows="3" style="' + inp + ';resize:vertical" placeholder="e.g. Ensure the change is minimal, correct, and matches the request. Flag scope creep or untested code.">' + esc(rev.prompt || "") + "</textarea>" +
     '<div style="height:12px"></div>' +
+    '<label>Criteria rubric <span style="opacity:.55">(optional — one per line; all must pass before “done”)</span></label>' +
+    '<textarea id="lvRubric" rows="3" style="' + inp + ';resize:vertical" placeholder="e.g.\nTests pass\nNo new TODOs\nMatches the requested API">' + esc(rev.rubric || "") + "</textarea>" +
+    '<div style="height:12px"></div>' +
     '<label>Mission <span style="opacity:.55">(optional — defaults to your request)</span></label>' +
     '<input id="lvMission" style="' + inp + '" value="' + esc(rev.mission || "") + '" />' +
     '<div style="height:12px"></div>' +
@@ -718,6 +721,7 @@ async function saveLoop(enabled) {
   const body = {
     enabled,
     prompt: $("lvPrompt").value,
+    rubric: $("lvRubric") ? $("lvRubric").value : "",
     mission: $("lvMission").value,
     model: $("lvModel").value,
     maxRounds: parseInt($("lvRounds").value, 10) || 4,
@@ -758,6 +762,9 @@ function renderSettings(s) {
     '<div class="set-sec"><h4>Permissions</h4><div class="desc"><b>Ask</b> prompts before each command or risky action. <b>Auto</b> approves them automatically (still shown in the log) — no more repeated prompts.</div>' +
       '<div class="seg" id="setPerm"><button data-p="ask"' + (s.permissionMode !== "auto" ? ' class="on"' : '') + '>Ask</button>' +
       '<button data-p="auto"' + (s.permissionMode === "auto" ? ' class="on"' : '') + '>Auto</button></div></div>' +
+    '<div class="set-sec"><h4>Context compression (FOCUS)</h4><div class="desc">How history is compressed once it gets long. <b>Offline</b> uses a fast local heuristic with a rule-based safety net. <b>Model review</b> runs the paper’s method — the model scores which spans to keep and reviews the rest for anything risky to drop — higher fidelity, but it spends extra model calls when compression triggers.</div>' +
+      '<div class="seg" id="setFocus"><button data-f="heuristic"' + ((!s.focusDraft || s.focusDraft === "heuristic") ? ' class="on"' : '') + '>Offline</button>' +
+      '<button data-f="model"' + (s.focusDraft === "model" ? ' class="on"' : '') + '>Model review</button></div></div>' +
     '<div class="set-sec"><h4>Export project</h4><div class="desc">Decrypt the ' + (s.fileCount || 0) + ' project file(s) to a real folder (plaintext) — for building or pushing to GitHub. This is the only thing that writes unencrypted data.</div>' +
       '<div class="set-row"><input class="mini-input" id="setExportDir" placeholder="./out (folder path)" /><button class="sm" id="setExport">Export</button></div>' +
       '<div class="ok-line" id="setExportMsg"></div></div>' +
@@ -846,6 +853,14 @@ function renderSettings(s) {
     const permissionMode = btn.getAttribute("data-p");
     if (permissionMode === (s.permissionMode || "ask")) return;
     const res = await api("/api/config", { method: "POST", body: JSON.stringify({ permissionMode }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) renderSettings(ns);
+  }));
+
+  $("setFocus").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const focusDraft = btn.getAttribute("data-f");
+    if (focusDraft === (s.focusDraft || "heuristic")) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ focusDraft }) });
     const ns = await res.json().catch(() => ({}));
     if (res.ok && !ns.error) renderSettings(ns);
   }));
