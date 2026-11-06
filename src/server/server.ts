@@ -33,6 +33,7 @@ import { compressHistory } from "../context/index.ts";
 import { toProviderMessages } from "../agent/conversation.ts";
 import { buildAgentPrompt } from "../agent/prompt.ts";
 import { runAgent } from "../agent/agentloop.ts";
+import { runReview, summarizeTrace, type Verdict } from "../agent/reviewer.ts";
 import { stripToolBlock } from "../agent/toolcall.ts";
 import { AgentLoopError } from "../agent/loopguard.ts";
 import type { Provider } from "../providers/types.ts";
@@ -146,6 +147,7 @@ export class GuiServer {
       if (path === "/api/models" && req.method === "POST") return await this.listModelsRoute(req);
       if (path === "/api/model" && req.method === "POST") return await this.setModel(req);
       if (path === "/api/config" && req.method === "POST") return await this.setAppConfig(req);
+      if (path === "/api/reviewer" && req.method === "POST") return await this.setReviewer(req);
       if (path === "/api/lock" && req.method === "POST") return this.lock();
       if (path === "/api/export" && req.method === "POST") return await this.exportProject(req);
       if (path === "/api/stream" && req.method === "GET") return this.stream();
@@ -176,6 +178,13 @@ export class GuiServer {
       baseUrl: current?.provider.baseUrl ?? null,
       mode: u?.mode ?? "build",
       permissionMode: u?.config.permissionMode ?? "ask",
+      reviewer: {
+        enabled: Boolean(u?.config.reviewer?.enabled),
+        prompt: u?.config.reviewer?.prompt ?? "",
+        mission: u?.config.reviewer?.mission ?? "",
+        model: u?.config.reviewer?.model ?? "",
+        maxRounds: u?.config.reviewer?.maxRounds ?? 4,
+      },
       fileCount: u ? u.fs.paths().length : 0,
       // Project tabs: the list, which is active, and which are unlocked.
       activeProject: this.activeId,
@@ -344,6 +353,26 @@ export class GuiServer {
     return this.state();
   }
 
+  private async setReviewer(req: Request): Promise<Response> {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    if (this.opts.demo) return this.state();
+    const body = (await req.json().catch(() => ({}))) as {
+      enabled?: boolean; prompt?: string; mission?: string; model?: string; maxRounds?: number;
+    };
+    const prompt = (body.prompt ?? "").trim();
+    if (body.enabled && !prompt) return json({ error: "a reviewer instruction is required to arm the loop" }, 400);
+    u.config.reviewer = {
+      enabled: Boolean(body.enabled),
+      prompt: prompt || undefined,
+      mission: (body.mission ?? "").trim() || undefined,
+      model: (body.model ?? "").trim() || undefined,
+      maxRounds: body.maxRounds ? Math.min(Math.max(Math.round(body.maxRounds), 1), 50) : undefined,
+    };
+    saveConfig(u.store, u.config);
+    return this.state();
+  }
+
   private lock(): Response {
     if (this.opts.demo) return this.state();
     const u = this.active();
@@ -435,49 +464,43 @@ export class GuiServer {
 
   private async runTurn(u: Unlocked, text: string): Promise<void> {
     try {
-      u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
-      const compressed = await compressHistory(u.sessions.messages(u.session), u.draft, text, u.config.focus);
-      if (compressed.report.triggered) {
-        const r = compressed.report;
-        this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` });
-      }
-      const result = await runAgent({
-        provider: u.provider,
-        model: u.model,
-        system: buildAgentPrompt({ fs: u.fs, registry: u.registry, mode: u.mode }),
-        messages: toProviderMessages(compressed.messages),
-        registry: u.registry,
-        ctx: u.ctx,
-        diagnostics: u.diagnostics,
-        onEvent: (e) => {
-          if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text });
-          else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text });
-          else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args });
-          else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output });
-          else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text });
-        },
-      });
-      // Persist the full trace (encrypted) so context survives.
-      for (const entry of result.trace) {
-        if (entry.kind === "assistant") {
-          const prose = stripToolBlock(entry.text);
-          const parts: ContentPart[] = [];
-          if (prose) parts.push({ type: "text", text: prose });
-          if (entry.call) parts.push({ type: "tool_call", id: newId("call"), name: entry.call.tool, args: entry.call.args });
-          if (parts.length === 0) parts.push({ type: "text", text: "(working…)" });
-          u.sessions.addMessage(u.session, "assistant", parts);
-        } else {
-          const t = entry.diagnostics ? `${entry.output}\n[diagnostics]\n${entry.diagnostics}` : entry.output;
-          u.sessions.addMessage(u.session, "tool", [{ type: "tool_result", id: newId("tr"), result: t, isError: !entry.ok }]);
+      const rev = u.config.reviewer;
+      const loopOn = Boolean(rev?.enabled && rev?.prompt && rev.prompt.trim());
+      const maxRounds = loopOn ? Math.min(Math.max(rev!.maxRounds ?? 4, 1), 50) : 1;
+      const mission = (rev?.mission && rev.mission.trim()) || text;
+      let userText = text;
+      let lastReason = "";
+
+      for (let round = 1; round <= maxRounds; round++) {
+        const result = await this.runWorkerTurn(u, userText);
+        this.pushFinal(result);
+        if (!loopOn) break;
+
+        if (round >= maxRounds) {
+          this.push({ type: "note", text: `Loop: reached the ${maxRounds}-round limit — stopping.` });
+          break;
         }
+        this.push({ type: "note", text: `Reviewer is checking the work (round ${round})…` });
+        const evidence = summarizeTrace(result.trace);
+        const endMessage = result.finalText.trim() || result.finalReasoning?.trim() || "(the worker produced no answer)";
+        const reviewerModel = (rev!.model && rev!.model.trim()) || u.model;
+        let review: { verdict?: Verdict; raw: string };
+        try {
+          review = await runReview(u.provider, reviewerModel, { review: rev!.prompt!, mission, endMessage, evidence, round, maxRounds });
+        } catch (e) {
+          this.push({ type: "note", text: `Reviewer error: ${(e as Error).message} — stopping the loop.` });
+          break;
+        }
+        const v = review.verdict;
+        this.push({ type: "reviewer", verdict: v?.verdict ?? "unclear", reason: v?.reason ?? review.raw.slice(0, 500), instruction: v && v.verdict === "continue" ? v.instruction : undefined });
+        if (!v) { this.push({ type: "note", text: "Reviewer gave no usable verdict — stopping the loop." }); break; }
+        if (v.verdict === "done") { this.push({ type: "note", text: `Reviewer approved the work — loop complete.` }); break; }
+        if (v.verdict === "blocked") { this.push({ type: "note", text: `Reviewer paused the loop (needs you): ${v.reason}` }); break; }
+        // continue — guard against spinning on the same unresolved reason.
+        if (v.reason && v.reason === lastReason) { this.push({ type: "note", text: "No progress since the last round — stopping the loop." }); break; }
+        lastReason = v.reason;
+        userText = v.instruction;
       }
-      // Handle the "empty answer" case (common with reasoning models that put
-      // everything in their think block): show the reasoning, not a blank bubble.
-      const finalText = result.finalText.trim();
-      if (finalText) this.push({ type: "assistant_final", text: finalText });
-      else if (result.finalReasoning && result.finalReasoning.trim())
-        this.push({ type: "assistant_final", text: "", reasoningOnly: true });
-      else this.push({ type: "assistant_final", text: "(no response — the model returned nothing; try again or switch models)", note: true });
     } catch (err) {
       if (err instanceof AgentLoopError) this.push({ type: "error", text: `stopped (${err.reason}): ${err.message}` });
       else if (err instanceof ProviderError) {
@@ -487,6 +510,55 @@ export class GuiServer {
     } finally {
       this.push({ type: "turn_done" });
     }
+  }
+
+  /** One worker turn: add the user message, compress, run the agent, persist. */
+  private async runWorkerTurn(u: Unlocked, text: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
+    u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
+    const compressed = await compressHistory(u.sessions.messages(u.session), u.draft, text, u.config.focus);
+    if (compressed.report.triggered) {
+      const r = compressed.report;
+      this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` });
+    }
+    const result = await runAgent({
+      provider: u.provider,
+      model: u.model,
+      system: buildAgentPrompt({ fs: u.fs, registry: u.registry, mode: u.mode }),
+      messages: toProviderMessages(compressed.messages),
+      registry: u.registry,
+      ctx: u.ctx,
+      diagnostics: u.diagnostics,
+      onEvent: (e) => {
+        if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text });
+        else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text });
+        else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args });
+        else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output });
+        else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text });
+      },
+    });
+    for (const entry of result.trace) {
+      if (entry.kind === "assistant") {
+        const prose = stripToolBlock(entry.text);
+        const parts: ContentPart[] = [];
+        if (prose) parts.push({ type: "text", text: prose });
+        if (entry.call) parts.push({ type: "tool_call", id: newId("call"), name: entry.call.tool, args: entry.call.args });
+        if (parts.length === 0) parts.push({ type: "text", text: "(working…)" });
+        u.sessions.addMessage(u.session, "assistant", parts);
+      } else {
+        const t = entry.diagnostics ? `${entry.output}\n[diagnostics]\n${entry.diagnostics}` : entry.output;
+        u.sessions.addMessage(u.session, "tool", [{ type: "tool_result", id: newId("tr"), result: t, isError: !entry.ok }]);
+      }
+    }
+    return result;
+  }
+
+  /** Render the worker's final answer (or the reasoning-only / empty cases). */
+  private pushFinal(result: Awaited<ReturnType<typeof runAgent>>): void {
+    const finalText = result.finalText.trim();
+    if (finalText) this.push({ type: "assistant_final", text: finalText });
+    else if (result.finalReasoning && result.finalReasoning.trim())
+      this.push({ type: "assistant_final", text: "", reasoningOnly: true });
+    else this.push({ type: "assistant_final", text: "(no response — the model returned nothing; try again or switch models)", note: true });
   }
 
   private requestPermission(action: string, detail: string): Promise<boolean> {

@@ -185,6 +185,26 @@
   .think.live summary .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: blink 1s infinite; }
   .bubble.reasoning-only { color: var(--muted); font-style: italic; }
 
+  /* Reviewer loop */
+  .reviewer { align-self: flex-start; max-width: min(760px, 86%); border: 1px solid #3a3a5a; border-left: 3px solid var(--accent); background: rgba(124,92,255,.06); border-radius: 10px; padding: 11px 14px; font-size: 13.5px; line-height: 1.5; }
+  .reviewer .rhead { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+  .reviewer .rlabel { font-size: 11px; font-weight: 700; letter-spacing: .4px; color: var(--accent); text-transform: uppercase; }
+  .reviewer .rverdict { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .3px; }
+  .rverdict.continue { background: rgba(255,207,107,.15); color: var(--warn); }
+  .rverdict.done { background: rgba(74,210,192,.15); color: var(--ok); }
+  .rverdict.blocked, .rverdict.unclear { background: rgba(255,107,107,.15); color: var(--danger); }
+  .reviewer .rinstr { margin-top: 7px; padding-top: 7px; border-top: 1px dashed #333; color: var(--text); }
+  .reviewer .rinstr b { color: var(--accent-2); }
+
+  .looprow { display: flex; margin-bottom: 9px; }
+  .loop-pill {
+    width: auto; background: var(--panel-2); color: var(--muted); border: 1px solid var(--border);
+    border-radius: 999px; padding: 6px 13px; font-size: 12px; font-weight: 600; display: inline-flex; gap: 7px; align-items: center;
+  }
+  .loop-pill:hover { filter: none; color: var(--text); border-color: var(--accent); }
+  .loop-pill.on { color: var(--accent-2); border-color: #244a45; background: rgba(74,210,192,.08); }
+  .loop-pill .ldot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
   .typing { display: inline-flex; gap: 4px; padding: 10px 14px; }
   .typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
   .typing i:nth-child(2){ animation-delay:.2s } .typing i:nth-child(3){ animation-delay:.4s }
@@ -230,6 +250,7 @@
     </header>
     <div id="messages"></div>
     <footer>
+      <div class="looprow"><button type="button" class="loop-pill" id="loopBtn"><span class="ldot"></span> Loop: off</button></div>
       <form class="composer" id="composer">
         <textarea id="input" placeholder="Ask AnonCode to build something…" rows="1"></textarea>
         <button type="submit" id="sendBtn">Send</button>
@@ -245,6 +266,16 @@
       <button class="iconbtn set-close" id="setClose" aria-label="Close">✕</button>
       <h3 style="margin:0 0 14px">Settings</h3>
       <div id="setBody"></div>
+    </div>
+  </div>
+
+  <!-- Reviewer loop overlay -->
+  <div id="loopModal" class="hidden" style="position:fixed;inset:0;background:rgba(5,6,10,.6);display:grid;place-items:center;backdrop-filter:blur(3px);z-index:5">
+    <div class="modal wide">
+      <button class="iconbtn set-close" id="loopClose" aria-label="Close">✕</button>
+      <h3 style="margin:0 0 4px">Reviewer loop</h3>
+      <div class="desc" style="color:var(--muted);font-size:12px;margin-bottom:14px;line-height:1.5">After each turn, a reviewer checks the work against the mission and feeds a correction back to the agent — up to the round limit — to catch mistakes and goal drift.</div>
+      <div id="loopBody"></div>
     </div>
   </div>
 
@@ -596,6 +627,12 @@ function applyHeader(info) {
   mp.textContent = info.mode || "build";
   mp.classList.toggle("hidden", !(info.mode === "plan"));
   if (info.demo) $("demoPill").classList.remove("hidden");
+  const rev = info.reviewer || {};
+  const lb = $("loopBtn");
+  if (lb) {
+    lb.classList.toggle("on", !!rev.enabled);
+    lb.innerHTML = '<span class="ldot"></span> Loop: ' + (rev.enabled ? "on · " + (rev.maxRounds || 4) + " rounds" : "off");
+  }
 }
 async function refreshHeaderModels() {
   if (lastState.demo || !lastState.provider) return;
@@ -634,8 +671,56 @@ $("setClose").addEventListener("click", () => $("settings").classList.add("hidde
 // Close only via the ✕ or Escape — never on an outside click, so dismissing a
 // native dropdown (or a stray click) doesn't nuke the whole panel.
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && !$("settings").classList.contains("hidden")) $("settings").classList.add("hidden");
+  if (e.key !== "Escape") return;
+  if (!$("settings").classList.contains("hidden")) $("settings").classList.add("hidden");
+  if (!$("loopModal").classList.contains("hidden")) $("loopModal").classList.add("hidden");
 });
+
+// ---- reviewer loop ---------------------------------------------------------
+$("loopBtn").addEventListener("click", openLoop);
+$("loopClose").addEventListener("click", () => $("loopModal").classList.add("hidden"));
+async function openLoop() {
+  let s; try { s = await api("/api/state").then((r) => r.json()); } catch { s = lastState; }
+  if (s.demo) { $("loopBody").innerHTML = '<div class="desc" style="color:var(--muted)">The reviewer loop needs a real model — it is disabled in demo mode.</div>'; $("loopModal").classList.remove("hidden"); return; }
+  renderLoop(s.reviewer || {});
+  $("loopModal").classList.remove("hidden");
+}
+function renderLoop(rev) {
+  const inp = "width:100%;background:#0a0c12;border:1px solid var(--border);color:var(--text);border-radius:11px;padding:11px 12px;font-size:14px;font-family:var(--sans);outline:none";
+  $("loopBody").innerHTML =
+    '<label>Reviewer instruction <span style="opacity:.55">(what it should check for)</span></label>' +
+    '<textarea id="lvPrompt" rows="3" style="' + inp + ';resize:vertical" placeholder="e.g. Ensure the change is minimal, correct, and matches the request. Flag scope creep or untested code.">' + esc(rev.prompt || "") + "</textarea>" +
+    '<div style="height:12px"></div>' +
+    '<label>Mission <span style="opacity:.55">(optional — defaults to your request)</span></label>' +
+    '<input id="lvMission" style="' + inp + '" value="' + esc(rev.mission || "") + '" />' +
+    '<div style="height:12px"></div>' +
+    '<div style="display:flex;gap:10px">' +
+      '<div style="flex:1"><label>Reviewer model <span style="opacity:.55">(optional)</span></label><input id="lvModel" style="' + inp + '" value="' + esc(rev.model || "") + '" placeholder="same as the agent" /></div>' +
+      '<div style="width:120px"><label>Max rounds</label><input id="lvRounds" type="number" min="1" max="50" style="' + inp + '" value="' + (rev.maxRounds || 4) + '" /></div>' +
+    "</div>" +
+    '<div style="height:16px"></div>' +
+    '<div style="display:flex;gap:10px">' +
+      (rev.enabled ? '<button id="lvDisarm" class="danger" style="flex:1">Disarm</button>' : "") +
+      '<button id="lvArm" style="flex:1">' + (rev.enabled ? "Update" : "Arm loop") + "</button>" +
+    "</div>" +
+    '<div class="err" id="lvErr" style="margin-top:10px"></div>';
+  $("lvArm").addEventListener("click", () => saveLoop(true));
+  const dis = $("lvDisarm"); if (dis) dis.addEventListener("click", () => saveLoop(false));
+}
+async function saveLoop(enabled) {
+  const body = {
+    enabled,
+    prompt: $("lvPrompt").value,
+    mission: $("lvMission").value,
+    model: $("lvModel").value,
+    maxRounds: parseInt($("lvRounds").value, 10) || 4,
+  };
+  const res = await api("/api/reviewer", { method: "POST", body: JSON.stringify(body) });
+  const s = await res.json().catch(() => ({}));
+  if (!res.ok || s.error) { $("lvErr").textContent = s.error || "Could not save the loop."; return; }
+  applyHeader(s);
+  $("loopModal").classList.add("hidden");
+}
 
 async function openSettings() {
   let s;
@@ -739,6 +824,17 @@ function ensureLive() {
 }
 function appendLive(text) { const b = ensureLive(); b.textContent += text; scrollDown(); }
 function finalizeLive() { liveBubble = null; }
+function addReviewer(e) {
+  finalizeLive();
+  const v = e.verdict || "unclear";
+  const d = document.createElement("div");
+  d.className = "reviewer";
+  d.innerHTML =
+    '<div class="rhead"><span class="rlabel">Reviewer</span><span class="rverdict ' + esc(v) + '">' + esc(v) + "</span></div>" +
+    '<div class="rreason">' + esc(e.reason || "") + "</div>" +
+    (e.instruction ? '<div class="rinstr"><b>Next:</b> ' + esc(e.instruction) + "</div>" : "");
+  messages.appendChild(d); scrollDown();
+}
 
 let eventSource = null;
 function connectEvents() {
@@ -748,6 +844,7 @@ function connectEvents() {
   es.onmessage = (ev) => {
     const e = JSON.parse(ev.data);
     if (e.type === "note") addEvent(esc(e.text), "note");
+    else if (e.type === "reviewer") { hideTyping(); addReviewer(e); showTyping(); }
     else if (e.type === "reasoning") { appendThink(e.text); }
     else if (e.type === "assistant_delta") { appendLive(e.text); }
     else if (e.type === "tool_call") { finalizeLive(); addEvent('⚙ <span class="tname">' + esc(e.tool) + '</span> <span class="chip">' + esc(JSON.stringify(e.args).slice(0,100)) + '</span>', ""); showTyping(); }

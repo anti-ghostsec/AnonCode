@@ -36,6 +36,20 @@ export type AppConfig = {
   diagnosticsCommand?: string;
   /** Real LSP diagnostics feedback. Preferred over diagnosticsCommand when enabled. */
   lsp?: { enabled?: boolean; servers?: ServerSpec[] };
+  /** Agentic reviewer loop: after each worker turn a reviewer critiques it
+   * against the mission and either approves, blocks, or feeds a correction back
+   * to the worker (up to maxRounds). Adapted from the opencode loop plugin. */
+  reviewer?: {
+    enabled?: boolean;
+    /** Stable reviewer instruction (what to check for). */
+    prompt?: string;
+    /** Optional mission override; when absent, the user's request is used. */
+    mission?: string;
+    /** Optional model for the reviewer (same provider); defaults to the worker's. */
+    model?: string;
+    /** Max worker↔reviewer rounds per turn (1–50, default 4). */
+    maxRounds?: number;
+  };
 };
 
 const COLLECTION = "_config";

@@ -88,6 +88,13 @@ pulled into a live, collapsible **thinking panel** — separate from the answer,
 so you can watch it reason and catch mistakes. If a model puts everything in its
 reasoning and returns no answer, you get a clear note instead of a blank bubble.
 
+A **reviewer loop** (the **Loop** pill above the composer) runs a second agent
+that reviews each turn against your mission and feeds a concrete correction back
+to the worker — catching mistakes and goal drift automatically — until it
+approves or hits the round limit. Arm it with a review instruction (and an
+optional separate reviewer model); reviewer verdicts (continue / done / blocked)
+show inline as you watch it self-correct.
+
 A **settings panel** (gear, top-right) lets you switch model/provider, flip
 between **Build** (can edit/run) and **Plan** (read-only) mode, choose a
 **permission mode** — **Ask** (prompt each time) or **Auto** (approve
