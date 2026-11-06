@@ -765,6 +765,9 @@ function renderSettings(s) {
     '<div class="set-sec"><h4>Context compression (FOCUS)</h4><div class="desc">How history is compressed once it gets long. <b>Offline</b> uses a fast local heuristic with a rule-based safety net. <b>Model review</b> runs the paper’s method — the model scores which spans to keep and reviews the rest for anything risky to drop — higher fidelity, but it spends extra model calls when compression triggers.</div>' +
       '<div class="seg" id="setFocus"><button data-f="heuristic"' + ((!s.focusDraft || s.focusDraft === "heuristic") ? ' class="on"' : '') + '>Offline</button>' +
       '<button data-f="model"' + (s.focusDraft === "model" ? ' class="on"' : '') + '>Model review</button></div></div>' +
+    '<div class="set-sec"><h4>Tool calling</h4><div class="desc"><b>Text</b> uses AnonCode’s portable fenced-block protocol (works with any model, including weak/local ones). <b>Native</b> uses the provider’s function-calling when supported — more reliable with strong models.</div>' +
+      '<div class="seg" id="setNative"><button data-nt="0"' + (!s.nativeTools ? ' class="on"' : '') + '>Text</button>' +
+      '<button data-nt="1"' + (s.nativeTools ? ' class="on"' : '') + '>Native</button></div></div>' +
     '<div class="set-sec"><h4>Best-of-N</h4><div class="desc">Generate several candidate attempts per turn (each isolated and rolled back) and keep the one a judge picks. Higher N = better results, N× the cost. Pairs best with <b>Auto</b> permissions. 1 = off.</div>' +
       '<div class="seg" id="setBestOf">' +
       [1, 2, 3, 5].map((v) => '<button data-n="' + v + '"' + ((s.bestOf || 1) === v ? ' class="on"' : '') + '>' + v + '</button>').join("") +
@@ -873,6 +876,14 @@ function renderSettings(s) {
     const bestOf = Number(btn.getAttribute("data-n"));
     if (bestOf === (s.bestOf || 1)) return;
     const res = await api("/api/config", { method: "POST", body: JSON.stringify({ bestOf }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) renderSettings(ns);
+  }));
+
+  $("setNative").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const nativeTools = btn.getAttribute("data-nt") === "1";
+    if (nativeTools === Boolean(s.nativeTools)) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ nativeTools }) });
     const ns = await res.json().catch(() => ({}));
     if (res.ok && !ns.error) renderSettings(ns);
   }));

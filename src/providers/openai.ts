@@ -3,6 +3,7 @@ import {
   type GenerateRequest,
   type GenerateResult,
   type ProviderContent,
+  type ProviderMessage,
   type StreamDelta,
   ProviderError,
   type ProviderErrorKind,
@@ -20,6 +21,7 @@ import { splitThink, ThinkStream } from "./reasoning.ts";
  */
 export class OpenAIProvider implements Provider {
   readonly name = "openai";
+  readonly supportsNativeTools = true;
 
   constructor(
     private readonly apiKey: string,
@@ -29,17 +31,22 @@ export class OpenAIProvider implements Provider {
   async generate(req: GenerateRequest): Promise<GenerateResult> {
     const messages: unknown[] = [];
     if (req.system) messages.push({ role: "system", content: req.system });
-    for (const m of req.messages) messages.push({ role: m.role, content: m.content.map(toOpenAIPart) });
+    for (const m of req.messages) messages.push(toOpenAIMessage(m));
 
     const headers: Record<string, string> = { "content-type": "application/json" };
     if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
+
+    const body: Record<string, unknown> = { model: req.model, max_tokens: req.maxTokens ?? 1024, messages };
+    if (req.tools?.length) {
+      body.tools = req.tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } }));
+    }
 
     let res: Response;
     try {
       res = await fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: req.model, max_tokens: req.maxTokens ?? 1024, messages }),
+        body: JSON.stringify(body),
       });
     } catch (e) {
       throw new ProviderError("network", `network error: ${(e as Error).message}`, true);
@@ -52,7 +59,7 @@ export class OpenAIProvider implements Provider {
     }
 
     const json = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string }; finish_reason?: string }>;
+      choices?: Array<{ message?: { content?: string; reasoning_content?: string; reasoning?: string; tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }> }; finish_reason?: string }>;
     };
     const choice = json.choices?.[0];
     const raw = choice?.message?.content ?? "";
@@ -60,13 +67,25 @@ export class OpenAIProvider implements Provider {
     // Some models also inline <think>…</think> in content; pull that out too.
     const split = splitThink(raw);
     const reasoning = [apiReasoning.trim(), split.reasoning].filter(Boolean).join("\n");
-    return { text: split.text, reasoning: reasoning || undefined, stopReason: choice?.finish_reason };
+    const toolCalls = (choice?.message?.tool_calls ?? [])
+      .map((tc, i) => {
+        let args: Record<string, unknown> = {};
+        try { args = tc.function?.arguments ? JSON.parse(tc.function.arguments) : {}; } catch { args = {}; }
+        return { id: tc.id || `call_${i}`, name: tc.function?.name ?? "", args };
+      })
+      .filter((tc) => tc.name);
+    return {
+      text: split.text,
+      reasoning: reasoning || undefined,
+      toolCalls: toolCalls.length ? toolCalls : undefined,
+      stopReason: choice?.finish_reason,
+    };
   }
 
   async generateStream(req: GenerateRequest, onDelta: (d: StreamDelta) => void): Promise<GenerateResult> {
     const messages: unknown[] = [];
     if (req.system) messages.push({ role: "system", content: req.system });
-    for (const m of req.messages) messages.push({ role: m.role, content: m.content.map(toOpenAIPart) });
+    for (const m of req.messages) messages.push(toOpenAIMessage(m));
 
     const headers: Record<string, string> = { "content-type": "application/json", accept: "text/event-stream" };
     if (this.apiKey) headers.authorization = `Bearer ${this.apiKey}`;
@@ -130,7 +149,28 @@ export class OpenAIProvider implements Provider {
 
 function toOpenAIPart(c: ProviderContent): unknown {
   if (c.type === "text") return { type: "text", text: c.text };
-  return { type: "image_url", image_url: { url: `data:${c.mime};base64,${c.dataB64}` } };
+  if (c.type === "image") return { type: "image_url", image_url: { url: `data:${c.mime};base64,${c.dataB64}` } };
+  // tool_use/tool_result are handled at the message level, not as content parts.
+  return { type: "text", text: "" };
+}
+
+/** Map a ProviderMessage to an OpenAI chat message, handling native tool calls
+ * (assistant `tool_calls`) and tool results (role "tool" with tool_call_id). */
+function toOpenAIMessage(m: ProviderMessage): unknown {
+  const toolResult = m.content.find((c) => c.type === "tool_result");
+  if (toolResult && toolResult.type === "tool_result") {
+    return { role: "tool", tool_call_id: toolResult.id, content: toolResult.content };
+  }
+  const toolUses = m.content.filter((c): c is Extract<ProviderContent, { type: "tool_use" }> => c.type === "tool_use");
+  if (toolUses.length) {
+    const text = m.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text).join("\n");
+    return {
+      role: "assistant",
+      content: text || null,
+      tool_calls: toolUses.map((t) => ({ id: t.id, type: "function", function: { name: t.name, arguments: JSON.stringify(t.input) } })),
+    };
+  }
+  return { role: m.role, content: m.content.map(toOpenAIPart) };
 }
 
 function classify(status: number, detail: string): ProviderErrorKind {

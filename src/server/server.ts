@@ -197,6 +197,7 @@ export class GuiServer {
       permissionMode: u?.config.permissionMode ?? "ask",
       focusDraft: u?.config.focusDraft ?? "heuristic",
       bestOf: u?.config.bestOf ?? 1,
+      nativeTools: Boolean(u?.config.nativeTools),
       reviewer: {
         enabled: Boolean(u?.config.reviewer?.enabled),
         prompt: u?.config.reviewer?.prompt ?? "",
@@ -408,7 +409,7 @@ export class GuiServer {
     const u = this.active();
     if (!u) return json({ error: "locked" }, 401);
     if (this.opts.demo) return this.state();
-    const { mode, permissionMode, memory, focusDraft, bestOf } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean; focusDraft?: string; bestOf?: number };
+    const { mode, permissionMode, memory, focusDraft, bestOf, nativeTools } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean; focusDraft?: string; bestOf?: number; nativeTools?: boolean };
     if (mode !== undefined) {
       if (mode !== "build" && mode !== "plan") return json({ error: "mode must be build or plan" }, 400);
       u.config.agentMode = mode;
@@ -425,6 +426,7 @@ export class GuiServer {
       u.config.focusDraft = focusDraft;
     }
     if (bestOf !== undefined) u.config.bestOf = Math.min(Math.max(Math.round(Number(bestOf) || 1), 1), 5);
+    if (nativeTools !== undefined) u.config.nativeTools = Boolean(nativeTools);
     saveConfig(u.store, u.config);
     return this.state();
   }
@@ -723,6 +725,7 @@ export class GuiServer {
       registry: u.registry,
       ctx: u.ctx,
       diagnostics: u.diagnostics,
+      nativeTools: u.config.nativeTools,
       onEvent: stream
         ? (e) => {
             if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text }, pid);

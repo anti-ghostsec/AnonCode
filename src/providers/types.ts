@@ -7,11 +7,23 @@
 
 export type ProviderContent =
   | { type: "text"; text: string }
-  | { type: "image"; mime: string; dataB64: string; filename?: string };
+  | { type: "image"; mime: string; dataB64: string; filename?: string }
+  /** A native tool call the assistant made (function-calling path). */
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
+  /** The result of a native tool call, linked back by id. */
+  | { type: "tool_result"; id: string; content: string; isError?: boolean };
 
 export type ProviderMessage = {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: ProviderContent[];
+};
+
+/** A tool offered to the model for native function-calling. */
+export type ProviderTool = {
+  name: string;
+  description: string;
+  /** JSON-Schema object describing the arguments. */
+  parameters: Record<string, unknown>;
 };
 
 export type GenerateRequest = {
@@ -19,6 +31,8 @@ export type GenerateRequest = {
   messages: ProviderMessage[];
   maxTokens?: number;
   system?: string;
+  /** When set, offer these tools for native function-calling. */
+  tools?: ProviderTool[];
 };
 
 export type GenerateResult = {
@@ -26,6 +40,8 @@ export type GenerateResult = {
   /** Model reasoning / chain-of-thought, when the model or API exposes it
    * (DeepSeek `reasoning_content`, inline `<think>…</think>`, etc.). */
   reasoning?: string;
+  /** Native tool calls the model requested this turn (function-calling path). */
+  toolCalls?: Array<{ id: string; name: string; args: Record<string, unknown> }>;
   stopReason?: string;
 };
 
@@ -58,6 +74,8 @@ export class ProviderError extends Error {
 
 export interface Provider {
   readonly name: string;
+  /** Whether `generate` honors `req.tools` and may return `toolCalls`. */
+  readonly supportsNativeTools?: boolean;
   generate(req: GenerateRequest): Promise<GenerateResult>;
   /** Optional streaming variant. When present, the agent loop uses it so the
    * UI can show tokens (and live reasoning) as they arrive. Implementations

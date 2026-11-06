@@ -148,10 +148,10 @@ export class AnthropicProvider implements Provider {
 
 function toAnthropicPart(c: ProviderContent): unknown {
   if (c.type === "text") return { type: "text", text: c.text };
-  return {
-    type: "image",
-    source: { type: "base64", media_type: c.mime, data: c.dataB64 },
-  };
+  if (c.type === "image") return { type: "image", source: { type: "base64", media_type: c.mime, data: c.dataB64 } };
+  if (c.type === "tool_use") return { type: "tool_use", id: c.id, name: c.name, input: c.input };
+  // tool_result
+  return { type: "tool_result", tool_use_id: c.id, content: c.content, is_error: c.isError };
 }
 
 function classify(status: number, detail: string): ProviderErrorKind {

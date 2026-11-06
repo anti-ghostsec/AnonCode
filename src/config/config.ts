@@ -72,6 +72,10 @@ export type AppConfig = {
   /** Best-of-N: generate N isolated candidates per turn and keep the judge's
    * pick (1 = off, default; max 5). Pairs well with Auto permissions. */
   bestOf?: number;
+  /** Use the provider's native function-calling instead of the fenced-text
+   * tool protocol, when the provider supports it (default off — the text
+   * protocol is the most portable across weak/local models). */
+  nativeTools?: boolean;
 };
 
 const COLLECTION = "_config";

@@ -4,6 +4,7 @@ import { preflightMessages } from "../providers/prepare.ts";
 import { DEFAULT_IMAGE_LIMITS, type ProviderImageLimits } from "../media/policy.ts";
 import { LoopGuard, DEFAULT_LOOP_GUARD, type LoopGuardOptions } from "./loopguard.ts";
 import { parseToolCall, type ToolCall } from "./toolcall.ts";
+import type { ProviderTool } from "../providers/types.ts";
 import type { ToolRegistry } from "../tools/registry.ts";
 import type { ToolContext } from "../tools/types.ts";
 import type { DiagnosticsProvider } from "../tools/diagnostics.ts";
@@ -53,6 +54,9 @@ export async function runAgent(opts: {
   limits?: ProviderImageLimits;
   guard?: LoopGuardOptions;
   maxTokens?: number;
+  /** Use the provider's native function-calling when it supports it, instead of
+   * the fenced-text tool protocol. Falls back to text when unsupported. */
+  nativeTools?: boolean;
   onEvent?: (e: AgentEvent) => void;
 }): Promise<AgentResult> {
   const limits = opts.limits ?? DEFAULT_IMAGE_LIMITS;
@@ -61,6 +65,11 @@ export async function runAgent(opts: {
   const convo: ProviderMessage[] = [...opts.messages];
   const trace: TraceEntry[] = [];
   let toolCalls = 0;
+
+  const useNative = Boolean(opts.nativeTools && opts.provider.supportsNativeTools);
+  if (useNative) {
+    return runNative({ ...opts, limits, diagnostics, guard, convo, trace });
+  }
 
   for (;;) {
     guard.beginStep();
@@ -104,6 +113,94 @@ export async function runAgent(opts: {
     if (result.ok) guard.recordProgress(`tool:${sig}`);
     else guard.recordError(`toolerr:${sig}`, result.output); // trips on repeated identical failure
   }
+}
+
+/** Native function-calling loop: the provider returns structured tool calls
+ * instead of a fenced-text block, and tool results feed back by call id. The
+ * trace it produces is identical in shape to the text path, so persistence and
+ * the reviewer evidence summary are unchanged. */
+async function runNative(ctx: {
+  provider: Provider;
+  model: string;
+  system: string;
+  registry: ToolRegistry;
+  ctx: ToolContext;
+  diagnostics: DiagnosticsProvider;
+  guard: LoopGuard;
+  convo: ProviderMessage[];
+  trace: TraceEntry[];
+  limits: ProviderImageLimits;
+  maxTokens?: number;
+  onEvent?: (e: AgentEvent) => void;
+}): Promise<AgentResult> {
+  const { provider, model, system, registry, guard, convo, trace, limits, onEvent } = ctx;
+  const tools: ProviderTool[] = registry.list().map(schemaToSpec);
+  let toolCalls = 0;
+
+  for (;;) {
+    guard.beginStep();
+    const pre = preflightMessages(convo, limits);
+    const res = await provider.generate({ model, system, messages: pre.messages, maxTokens: ctx.maxTokens, tools });
+    if (res.reasoning) onEvent?.({ type: "reasoning", text: res.reasoning });
+    if (res.text) onEvent?.({ type: "assistant_delta", text: res.text });
+
+    const calls = res.toolCalls ?? [];
+    if (calls.length === 0) {
+      trace.push({ kind: "assistant", text: res.text });
+      guard.recordProgress(`final:${hash(res.text)}`);
+      return { finalText: res.text, finalReasoning: res.reasoning, steps: guard.stepCount, toolCalls, trace };
+    }
+
+    // One assistant message carries any prose plus every tool_use this step.
+    convo.push({
+      role: "assistant",
+      content: [
+        ...(res.text ? [{ type: "text" as const, text: res.text }] : []),
+        ...calls.map((c) => ({ type: "tool_use" as const, id: c.id, name: c.name, input: c.args })),
+      ],
+    });
+
+    for (let i = 0; i < calls.length; i++) {
+      const c = calls[i]!;
+      toolCalls++;
+      const call: ToolCall = { tool: c.name, args: c.args };
+      onEvent?.({ type: "tool_call", call });
+      // Attach the assistant prose to the first call's trace entry only.
+      trace.push({ kind: "assistant", text: i === 0 ? res.text : "", call });
+
+      let result;
+      try {
+        result = await registry.execute(call.tool, call.args, ctx.ctx);
+      } catch (e) {
+        result = { ok: false, output: `tool error: ${(e as Error).message}` };
+      }
+      onEvent?.({ type: "tool_result", tool: call.tool, ok: result.ok, output: result.output });
+
+      let diagText = "";
+      if (result.ok && result.changed && result.changed.length > 0 && ctx.ctx.runspace) {
+        diagText = await ctx.diagnostics.check(result.changed, ctx.ctx.runspace.dir);
+        if (diagText.trim()) onEvent?.({ type: "diagnostics", text: diagText });
+      }
+      const content = `${result.output}` + (diagText.trim() ? `\n\n[diagnostics]\n${diagText}` : "");
+      convo.push({ role: "tool", content: [{ type: "tool_result", id: c.id, content, isError: !result.ok }] });
+      trace.push({ kind: "tool_result", tool: call.tool, ok: result.ok, output: result.output, diagnostics: diagText.trim() || undefined });
+
+      const sig = `${call.tool}:${hash(JSON.stringify(call.args))}:${result.ok ? "ok" : "err"}`;
+      if (result.ok) guard.recordProgress(`tool:${sig}`);
+      else guard.recordError(`toolerr:${sig}`, result.output);
+    }
+  }
+}
+
+/** Turn a tool's schema into a JSON-Schema function spec for native calling. */
+function schemaToSpec(tool: { schema: { name: string; description: string; args: Record<string, string>; required: string[] } }): ProviderTool {
+  const properties: Record<string, unknown> = {};
+  for (const [k, desc] of Object.entries(tool.schema.args)) properties[k] = { type: "string", description: desc };
+  return {
+    name: tool.schema.name,
+    description: tool.schema.description,
+    parameters: { type: "object", properties, required: tool.schema.required },
+  };
 }
 
 async function generateOnce(
