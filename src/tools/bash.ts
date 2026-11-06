@@ -31,7 +31,7 @@ export const bashTool: Tool = defineTool(
   },
 );
 
-function runShell(command: string, cwd: string, timeoutMs: number): Promise<{ code: number; out: string }> {
+export function runShell(command: string, cwd: string, timeoutMs: number): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
     const child = spawn("bash", ["-lc", command], { cwd });
     let out = "";

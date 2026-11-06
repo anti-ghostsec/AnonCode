@@ -50,6 +50,14 @@ export type AppConfig = {
     /** Max worker↔reviewer rounds per turn (1–50, default 4). */
     maxRounds?: number;
   };
+  /** Deterministic verifier gate: a check command (tests/build/lint) run after
+   * each build turn; on failure its output is fed back to the worker to fix,
+   * bounded by the reviewer loop's maxRounds. Complements the reviewer. */
+  verifier?: {
+    enabled?: boolean;
+    /** e.g. "bun test", "bun x tsc --noEmit", "cargo check". */
+    command?: string;
+  };
 };
 
 const COLLECTION = "_config";

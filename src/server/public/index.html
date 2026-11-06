@@ -684,10 +684,11 @@ $("loopClose").addEventListener("click", () => $("loopModal").classList.add("hid
 async function openLoop() {
   let s; try { s = await api("/api/state").then((r) => r.json()); } catch { s = lastState; }
   if (s.demo) { $("loopBody").innerHTML = '<div class="desc" style="color:var(--muted)">The reviewer loop needs a real model — it is disabled in demo mode.</div>'; $("loopModal").classList.remove("hidden"); return; }
-  renderLoop(s.reviewer || {});
+  renderLoop(s.reviewer || {}, s.verifier || {});
   $("loopModal").classList.remove("hidden");
 }
-function renderLoop(rev) {
+function renderLoop(rev, ver) {
+  ver = ver || {};
   const inp = "width:100%;background:#0a0c12;border:1px solid var(--border);color:var(--text);border-radius:11px;padding:11px 12px;font-size:14px;font-family:var(--sans);outline:none";
   $("loopBody").innerHTML =
     '<label>Reviewer instruction <span style="opacity:.55">(what it should check for)</span></label>' +
@@ -700,6 +701,10 @@ function renderLoop(rev) {
       '<div style="flex:1"><label>Reviewer model <span style="opacity:.55">(optional)</span></label><input id="lvModel" style="' + inp + '" value="' + esc(rev.model || "") + '" placeholder="same as the agent" /></div>' +
       '<div style="width:120px"><label>Max rounds</label><input id="lvRounds" type="number" min="1" max="50" style="' + inp + '" value="' + (rev.maxRounds || 4) + '" /></div>' +
     "</div>" +
+    '<div style="height:16px"></div>' +
+    '<label>Verifier check <span style="opacity:.55">(optional — a command run after each build turn; on failure the worker is asked to fix it)</span></label>' +
+    '<input id="lvVerCmd" style="' + inp + '" value="' + esc(ver.command || "") + '" placeholder="e.g. bun test" />' +
+    '<label style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;cursor:pointer;color:var(--muted)"><input type="checkbox" id="lvVerOn"' + (ver.enabled ? " checked" : "") + " /> Run this check automatically</label>" +
     '<div style="height:16px"></div>' +
     '<div style="display:flex;gap:10px">' +
       (rev.enabled ? '<button id="lvDisarm" class="danger" style="flex:1">Disarm</button>' : "") +
@@ -720,7 +725,12 @@ async function saveLoop(enabled) {
   const res = await api("/api/reviewer", { method: "POST", body: JSON.stringify(body) });
   const s = await res.json().catch(() => ({}));
   if (!res.ok || s.error) { $("lvErr").textContent = s.error || "Could not save the loop."; return; }
-  applyHeader(s);
+  // Save the verifier check alongside the reviewer config.
+  const verBody = { enabled: $("lvVerOn") && $("lvVerOn").checked, command: $("lvVerCmd") ? $("lvVerCmd").value : "" };
+  const vres = await api("/api/verifier", { method: "POST", body: JSON.stringify(verBody) });
+  const vs = await vres.json().catch(() => ({}));
+  if (!vres.ok || vs.error) { $("lvErr").textContent = vs.error || "Could not save the check."; return; }
+  applyHeader(vs);
   $("loopModal").classList.add("hidden");
 }
 
@@ -751,8 +761,32 @@ function renderSettings(s) {
     '<div class="set-sec"><h4>Export project</h4><div class="desc">Decrypt the ' + (s.fileCount || 0) + ' project file(s) to a real folder (plaintext) — for building or pushing to GitHub. This is the only thing that writes unencrypted data.</div>' +
       '<div class="set-row"><input class="mini-input" id="setExportDir" placeholder="./out (folder path)" /><button class="sm" id="setExport">Export</button></div>' +
       '<div class="ok-line" id="setExportMsg"></div></div>' +
+    '<div class="set-sec"><h4>History</h4><div class="desc">AnonCode checkpoints the project (encrypted, in-vault) before each change. Undo reverts the most recent change — it walks back one turn at a time.</div>' +
+      '<div class="set-row"><div class="val" id="setSnapCount">checking…</div><button class="sm ghost" id="setUndo">Undo last change</button></div>' +
+      '<div class="ok-line" id="setUndoMsg"></div></div>' +
     '<div class="set-sec"><h4>Security</h4><div class="desc">Lock the vault to wipe the in-memory key and the temporary runspace. You\'ll need your passphrase to get back in.</div>' +
       '<button class="danger" id="setLock">Lock vault</button></div>';
+
+  (async () => {
+    try {
+      const snaps = (await api("/api/snapshots").then((r) => r.json())).snapshots || [];
+      const el = $("setSnapCount");
+      if (el) el.textContent = snaps.length ? snaps.length + " checkpoint(s)" : "no checkpoints yet";
+    } catch {}
+  })();
+
+  $("setUndo").addEventListener("click", async () => {
+    const msg = $("setUndoMsg");
+    msg.style.color = "var(--muted)"; msg.textContent = "Reverting…";
+    const res = await api("/api/undo", { method: "POST" });
+    const r = await res.json().catch(() => ({}));
+    if (res.ok && r.ok) {
+      msg.style.color = "var(--ok)";
+      msg.textContent = 'Undid "' + (r.label || "last change") + '" — ' + (r.fileCount || 0) + " file(s) now.";
+      const snaps = (await api("/api/snapshots").then((x) => x.json()).catch(() => ({ snapshots: [] }))).snapshots || [];
+      $("setSnapCount").textContent = snaps.length ? snaps.length + " checkpoint(s)" : "no checkpoints yet";
+    } else { msg.style.color = "var(--danger)"; msg.textContent = r.error || "Nothing to undo."; }
+  });
 
   $("setChange").addEventListener("click", () => {
     body.innerHTML = '<div class="desc" style="margin-bottom:12px">Connect a different model.</div><div id="setPf"></div>';
@@ -935,6 +969,7 @@ function connectEvents() {
     if (e.project && e.project !== shownProject) return;
     if (e.type === "note") addEvent(esc(e.text), "note");
     else if (e.type === "reviewer") { hideTyping(); addReviewer(e); showTyping(); }
+    else if (e.type === "verifier") { hideTyping(); addEvent('<span class="chip ' + (e.ok ? "" : "err") + '">✓ checks ' + (e.ok ? "passed" : "failed") + "</span>" + (e.ok ? "" : ' <span class="chip">' + esc((e.output || "").split("\n").slice(0, 2).join(" ").slice(0, 140)) + "</span>"), ""); showTyping(); }
     else if (e.type === "reasoning") { appendThink(e.text); }
     else if (e.type === "assistant_delta") { appendLive(e.text); }
     else if (e.type === "tool_call") { finalizeLive(); addEvent('⚙ <span class="tname">' + esc(e.tool) + '</span> <span class="chip">' + esc(JSON.stringify(e.args).slice(0,100)) + '</span>', ""); showTyping(); }

@@ -24,6 +24,7 @@ import { SessionStore } from "../session/store.ts";
 import type { Session, ContentPart } from "../session/types.ts";
 import { EncryptedFS } from "../vfs/efs.ts";
 import { Runspace } from "../vfs/runspace.ts";
+import { SnapshotStore } from "../vfs/snapshots.ts";
 import { defaultTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolContext } from "../tools/types.ts";
 import { NoDiagnostics, CommandDiagnostics, type DiagnosticsProvider } from "../tools/diagnostics.ts";
@@ -34,6 +35,7 @@ import { toProviderMessages } from "../agent/conversation.ts";
 import { buildAgentPrompt } from "../agent/prompt.ts";
 import { runAgent } from "../agent/agentloop.ts";
 import { runReview, summarizeTrace, type Verdict } from "../agent/reviewer.ts";
+import { runVerifier, verifierFeedback } from "../agent/verifier.ts";
 import { stripToolBlock } from "../agent/toolcall.ts";
 import { AgentLoopError } from "../agent/loopguard.ts";
 import type { Provider } from "../providers/types.ts";
@@ -56,6 +58,7 @@ type Unlocked = {
   draft: HeuristicDraftModel;
   sessions: SessionStore;
   session: Session;
+  snapshots: SnapshotStore;
   config: ReturnType<typeof loadConfig>;
 };
 
@@ -150,7 +153,10 @@ export class GuiServer {
       if (path === "/api/model" && req.method === "POST") return await this.setModel(req);
       if (path === "/api/config" && req.method === "POST") return await this.setAppConfig(req);
       if (path === "/api/reviewer" && req.method === "POST") return await this.setReviewer(req);
+      if (path === "/api/verifier" && req.method === "POST") return await this.setVerifier(req);
       if (path === "/api/lock" && req.method === "POST") return this.lock();
+      if (path === "/api/snapshots") return this.snapshotsRoute();
+      if (path === "/api/undo" && req.method === "POST") return this.undoRoute();
       if (path === "/api/export" && req.method === "POST") return await this.exportProject(req);
       if (path === "/api/stream" && req.method === "GET") return this.stream();
       if (path === "/api/message" && req.method === "POST") return await this.message(req);
@@ -186,6 +192,10 @@ export class GuiServer {
         mission: u?.config.reviewer?.mission ?? "",
         model: u?.config.reviewer?.model ?? "",
         maxRounds: u?.config.reviewer?.maxRounds ?? 4,
+      },
+      verifier: {
+        enabled: Boolean(u?.config.verifier?.enabled),
+        command: u?.config.verifier?.command ?? "",
       },
       fileCount: u ? u.fs.paths().length : 0,
       // Project tabs: the list, which is active, and which are unlocked.
@@ -407,6 +417,18 @@ export class GuiServer {
     return this.state();
   }
 
+  private async setVerifier(req: Request): Promise<Response> {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    if (this.opts.demo) return this.state();
+    const body = (await req.json().catch(() => ({}))) as { enabled?: boolean; command?: string };
+    const command = (body.command ?? "").trim();
+    if (body.enabled && !command) return json({ error: "a check command is required to enable the verifier" }, 400);
+    u.config.verifier = { enabled: Boolean(body.enabled), command: command || undefined };
+    saveConfig(u.store, u.config);
+    return this.state();
+  }
+
   private lock(): Response {
     if (this.opts.demo) return this.state();
     const u = this.active();
@@ -416,6 +438,31 @@ export class GuiServer {
       this.projects.delete(u.id);
     }
     return this.state();
+  }
+
+  /** The undo stack: a compact list of this project's snapshots, newest first. */
+  private snapshotsRoute(): Response {
+    const u = this.active();
+    if (!u) return json({ snapshots: [] });
+    const metas = u.snapshots.list().slice().reverse();
+    return json({
+      snapshots: metas.map((m) => ({ id: m.id, label: m.label, createdAt: m.createdAt, files: Object.keys(m.files).length })),
+    });
+  }
+
+  /** Undo: restore the most recent snapshot and re-materialize the runspace. */
+  private undoRoute(): Response {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    if (this.opts.demo) return json({ error: "undo is disabled in demo mode" }, 400);
+    const undone = u.snapshots.undo(u.fs);
+    if (!undone) return json({ error: "nothing to undo yet" }, 400);
+    // The plaintext runspace mirror is now stale — rebuild it from the vault.
+    u.runspace.wipe();
+    u.runspace = Runspace.materialize(u.fs, u.runspace.dir);
+    u.ctx.runspace = u.runspace;
+    this.push({ type: "note", text: `Undid "${undone.label}" — reverted to the earlier state.` }, u.id);
+    return json({ ok: true, label: undone.label, fileCount: u.fs.paths().length });
   }
 
   private async exportProject(req: Request): Promise<Response> {
@@ -505,10 +552,17 @@ export class GuiServer {
 
   private async runTurn(u: Unlocked, text: string): Promise<void> {
     const pid = u.id;
+    // Checkpoint the project before a build turn so the change is undoable.
+    // (No-op snapshots — nothing changed since the last — are skipped.)
+    if (u.mode === "build" && !this.opts.demo) {
+      try { u.snapshots.snapshot(u.fs, text); } catch { /* snapshots are best-effort */ }
+    }
     try {
       const rev = u.config.reviewer;
       const loopOn = Boolean(rev?.enabled && rev?.prompt && rev.prompt.trim());
-      const maxRounds = loopOn ? Math.min(Math.max(rev!.maxRounds ?? 4, 1), 50) : 1;
+      const ver = u.config.verifier;
+      const verifierOn = Boolean(ver?.enabled && ver?.command && ver.command.trim() && u.mode === "build" && !this.opts.demo);
+      const maxRounds = (loopOn || verifierOn) ? Math.min(Math.max(rev?.maxRounds ?? 4, 1), 50) : 1;
       const mission = (rev?.mission && rev.mission.trim()) || text;
       let userText = text;
       let lastReason = "";
@@ -516,6 +570,23 @@ export class GuiServer {
       for (let round = 1; round <= maxRounds; round++) {
         const result = await this.runWorkerTurn(u, userText);
         this.pushFinal(result, pid);
+
+        // Deterministic verifier gate: run the check command; on failure, loop
+        // the output back to the worker (before the reviewer even sees it).
+        if (verifierOn && u.runspace) {
+          const cmd = ver!.command!.trim();
+          this.push({ type: "note", text: `Running checks: ${cmd}…` }, pid);
+          const vr = await runVerifier(cmd, u.runspace.dir);
+          this.push({ type: "verifier", ok: vr.ok, output: vr.output.slice(0, 1500) }, pid);
+          if (!vr.ok) {
+            if (round >= maxRounds) { this.push({ type: "note", text: "Checks still failing — reached the round limit." }, pid); break; }
+            this.push({ type: "note", text: "Checks failed — asking the worker to fix them." }, pid);
+            userText = verifierFeedback(cmd, vr.output);
+            continue; // back to the worker, skipping the reviewer this round
+          }
+          this.push({ type: "note", text: "Checks passed ✓" }, pid);
+        }
+
         if (!loopOn) break;
 
         if (round >= maxRounds) {
@@ -676,7 +747,8 @@ export class GuiServer {
     };
     const sessions = new SessionStore(store);
     const session = sessions.createSession({ provider: providerName, model, title: `gui ${new Date().toISOString()}` });
-    return { id, name, store, fs, runspace, provider, providerName, model, mode, registry, ctx, diagnostics, draft: new HeuristicDraftModel(), sessions, session, config };
+    const snapshots = new SnapshotStore(store);
+    return { id, name, store, fs, runspace, provider, providerName, model, mode, registry, ctx, diagnostics, draft: new HeuristicDraftModel(), sessions, session, snapshots, config };
   }
 }
 
