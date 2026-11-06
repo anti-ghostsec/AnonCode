@@ -119,6 +119,24 @@ export async function focusCompress(
     return { id: s.id, kind: s.kind, index: s.index, tokens: s.tokens, score, kept, protectedSpan, reasons };
   });
 
+  // Defensive verification (paper §4.4 / Algorithm 1): let the draft model
+  // review the spans NOT yet kept and rescue any whose loss risks catastrophic
+  // forgetting (S_R). Rescued spans become protected so the hard cap won't drop
+  // them. Draft models without this method fall back to the rule-based floor.
+  if (draft.reviewForRescue) {
+    const uncited = spans.filter((_, i) => !decisions[i]!.kept);
+    if (uncited.length) {
+      const rescued = new Set(await draft.reviewForRescue(uncited, task));
+      for (const d of decisions) {
+        if (!d.kept && rescued.has(d.id)) {
+          d.kept = true;
+          d.protectedSpan = true;
+          d.reasons.push("defensive: draft-model rescue (S_R)");
+        }
+      }
+    }
+  }
+
   // Optional hard cap.
   if (opts.hardCapTokens !== undefined) {
     let keptTokens = decisions.filter((d) => d.kept).reduce((a, d) => a + d.tokens, 0);

@@ -798,7 +798,13 @@ export class GuiServer {
       allow: (action, detail) => this.requestPermission(action, detail),
     };
     const sessions = new SessionStore(store);
-    const session = sessions.createSession({ provider: providerName, model, title: `gui ${new Date().toISOString()}` });
+    // Resume the most recently-active session so the conversation survives a
+    // lock/unlock or app restart (its messages are already sealed in the store).
+    // Only start fresh when this project has no prior session.
+    const prior = sessions.listSessions();
+    const session = prior.length
+      ? prior.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b))
+      : sessions.createSession({ provider: providerName, model, title: `gui ${new Date().toISOString()}` });
     const snapshots = new SnapshotStore(store);
     const memory = new MemoryStore(store);
     return { id, name, store, fs, runspace, provider, providerName, model, mode, registry, ctx, diagnostics, draft: new HeuristicDraftModel(), sessions, session, snapshots, memory, config };

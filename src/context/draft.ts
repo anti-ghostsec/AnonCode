@@ -16,6 +16,14 @@ import type { Provider } from "../providers/types.ts";
  */
 export interface DraftModel {
   citedSpans(spans: Span[], task: string): Promise<string[]>;
+  /**
+   * The paper's defensive verification (Algorithm 1, §4.4): review the spans
+   * NOT retained by optimistic planning and return the ids whose deletion would
+   * risk catastrophic forgetting (repeated mistakes, invalid loops, lost causal
+   * state) — the rescued set S_R. Optional: when a draft model doesn't implement
+   * it, FOCUS falls back to its rule-based defensive floor.
+   */
+  reviewForRescue?(uncited: Span[], task: string): Promise<string[]>;
 }
 
 const STOP = new Set([
@@ -80,6 +88,47 @@ export class ModelDraftModel implements DraftModel {
     });
     return parseDependsOn(res.text, new Set(spans.map((s) => s.id)));
   }
+
+  /** The paper's defensive verification: ask the draft model which uncited
+   * spans must be rescued to avoid catastrophic forgetting. */
+  async reviewForRescue(uncited: Span[], task: string): Promise<string[]> {
+    if (uncited.length === 0) return [];
+    const index = uncited
+      .map((s) => `id=${s.id} [${s.kind}] ${truncate(s.text, 200)}`)
+      .join("\n");
+    const prompt =
+      "You are verifying a context-compression decision for a coding task.\n" +
+      `Task: ${task}\n\n` +
+      "The following history spans were NOT selected to keep. Flag ONLY those " +
+      "whose removal would cause repeated mistakes, invalid loops, or loss of " +
+      "causal state the agent still needs (e.g. a failed attempt, a rejected " +
+      "request, a decision or constraint stated earlier).\n\n" +
+      `Candidate spans:\n${index}\n\n` +
+      "Output one line:\nRescue: [<span ids to keep>]\n" +
+      "List an id only if losing it is genuinely risky; an empty list is fine.";
+    const res = await this.provider.generate({
+      model: this.model,
+      messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+      maxTokens: this.maxTokens,
+    });
+    return parseRescue(res.text, new Set(uncited.map((s) => s.id)));
+  }
+}
+
+/** Extract rescued span ids from a defensive-verification reply. */
+export function parseRescue(text: string, valid: Set<string>): string[] {
+  const cited = new Set<string>();
+  const re = /rescue:\s*\[([^\]]*)\]/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    for (const tok of m[1]!.split(/[,\s]+/)) {
+      const id = tok.trim();
+      if (id && valid.has(id)) cited.add(id);
+    }
+  }
+  // Also honor any valid id mentioned verbatim (robust to format drift).
+  for (const id of valid) if (text.includes(id)) cited.add(id);
+  return [...cited];
 }
 
 /** Extract cited span ids from a draft plan. Reads `Depends on: [...]` lists

@@ -2,7 +2,7 @@ import { test, expect } from "bun:test";
 import type { Message, Role, ContentPart } from "../src/session/types.ts";
 import { buildSpans } from "../src/context/span.ts";
 import { focusCompress, type FocusOptions } from "../src/context/focus.ts";
-import { parseDependsOn, HeuristicDraftModel, type DraftModel } from "../src/context/draft.ts";
+import { parseDependsOn, parseRescue, HeuristicDraftModel, type DraftModel } from "../src/context/draft.ts";
 import { compressHistory } from "../src/context/index.ts";
 
 let counter = 0;
@@ -130,6 +130,47 @@ test("the hard cap drops the lowest-utility non-protected span", async () => {
   expect(ids.has(goal.id)).toBe(true); // protected
   expect(ids.has(hi.id)).toBe(true); // higher utility retained
   expect(ids.has(lo.id)).toBe(false); // lower utility dropped to fit cap
+});
+
+test("defensive verification: the draft model rescues an uncited span (paper S_R)", async () => {
+  const goal = msg("user", "build the parser");
+  const a = msg("assistant", "I chose a recursive-descent design after rejecting PEG");
+  const b = msg("assistant", "some unrelated commentary");
+  const recent = msg("user", "keep going");
+  const spans = buildSpans([goal, a, b, recent]);
+
+  // Draft cites nothing (so a and b fall out of S_U), but its defensive review
+  // flags span `a` (a design decision) as must-keep.
+  const draft: DraftModel = {
+    async citedSpans() { return []; },
+    async reviewForRescue(uncited) { return uncited.filter((s) => s.id === a.id).map((s) => s.id); },
+  };
+  const { kept } = await focusCompress(spans, draft, "continue building", {
+    memoryBudgetTokens: 1, tau: 0.9, rollouts: 1, keepRecent: 1,
+  });
+  const keptMsgs = new Set(kept.flatMap((s) => s.messageIds));
+  expect(keptMsgs.has(a.id)).toBe(true); // rescued by defensive verification
+  expect(keptMsgs.has(b.id)).toBe(false); // neither cited nor rescued → dropped
+});
+
+test("a draft model without reviewForRescue falls back to the rule-based floor", async () => {
+  // HeuristicDraftModel has no reviewForRescue; errors/user/recent still hold.
+  const goal = msg("user", "task");
+  const a = msg("assistant", "unrelated");
+  const recent = msg("user", "next");
+  const spans = buildSpans([goal, a, recent]);
+  const { kept } = await focusCompress(spans, new HeuristicDraftModel(), "zzz", {
+    memoryBudgetTokens: 1, tau: 0.9, rollouts: 1, keepRecent: 1,
+  });
+  const keptMsgs = new Set(kept.flatMap((s) => s.messageIds));
+  expect(keptMsgs.has(goal.id)).toBe(true);
+  expect(keptMsgs.has(recent.id)).toBe(true);
+});
+
+test("parseRescue extracts only valid rescued ids", () => {
+  const valid = new Set(["m1", "m4"]);
+  expect(parseRescue("Rescue: [m1, m4, mZ]", valid).sort()).toEqual(["m1", "m4"]);
+  expect(parseRescue("Rescue: []", valid)).toEqual([]);
 });
 
 test("parseDependsOn extracts only valid cited ids", () => {

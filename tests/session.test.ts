@@ -37,6 +37,27 @@ test("message contents are encrypted on disk", () => {
   expect(raw.includes("wallet seed")).toBe(false);
 });
 
+test("a reopened store resumes the most recent session and its messages (restart)", async () => {
+  // Models the restart fix: the server rebuilds SessionStore over the same
+  // vault and must resume the latest session rather than start a blank one.
+  const base = mkdtempSync(join(dir, "resume-"));
+  const v = Vault.create("pw", FAST);
+  const first = new SessionStore(new EncryptedStore(v, base));
+  const older = first.createSession({ provider: "mock", model: "m" });
+  await Bun.sleep(2);
+  const newer = first.createSession({ provider: "mock", model: "m" });
+  first.addMessage(newer, "user", [{ type: "text", text: "remember this across restart" }]);
+
+  // "Restart": a brand-new SessionStore over the same encrypted store.
+  const reopened = new SessionStore(new EncryptedStore(Vault.unlock("pw", v.header), base));
+  const prior = reopened.listSessions();
+  expect(prior.length).toBe(2);
+  const resumed = prior.reduce((a, b) => (a.updatedAt >= b.updatedAt ? a : b));
+  expect(resumed.id).toBe(newer.id); // the most recently-active one
+  const texts = reopened.messages(resumed).map((m) => (m.parts[0]!.type === "text" ? m.parts[0]!.text : ""));
+  expect(texts).toContain("remember this across restart");
+});
+
 test("sessions are isolated by id", () => {
   const sessions = new SessionStore(freshStore());
   const a = sessions.createSession({ provider: "mock", model: "m" });
