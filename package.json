@@ -1,0 +1,23 @@
+{
+  "name": "anoncode",
+  "version": "0.0.1",
+  "description": "Private, encryption-first AI coding agent. All data stays in-folder and encrypted at rest.",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "anoncode": "./bin/anoncode"
+  },
+  "scripts": {
+    "anoncode": "bun run src/cli/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "bun-types": "^1.4.4",
+    "typescript": "^5.6.0"
+  }
+}

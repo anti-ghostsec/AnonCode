@@ -1,0 +1,14 @@
+# Runtime data: encrypted vault, sessions, files, local config.
+# Never commit any of this — it is user data and must stay local.
+.anoncode/
+
+# Dependencies and build output
+node_modules/
+dist/
+*.log
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+AnonCode.desktop

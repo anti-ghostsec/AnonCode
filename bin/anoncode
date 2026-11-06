@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# AnonCode launcher. Resolves to the project root regardless of symlinks.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+exec bun run "$here/src/cli/index.ts" "$@"

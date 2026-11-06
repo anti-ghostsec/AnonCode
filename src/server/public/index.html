@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AnonCode</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --panel: #12151d;
+    --panel-2: #171b26;
+    --border: #232838;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --accent: #7c5cff;
+    --accent-2: #4ad2c0;
+    --user: #1d2336;
+    --ai: #141a28;
+    --danger: #ff6b6b;
+    --warn: #ffcf6b;
+    --ok: #4ad2c0;
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: radial-gradient(1200px 600px at 80% -10%, #1a1230 0%, transparent 60%),
+                radial-gradient(900px 500px at -10% 110%, #0c2a2a 0%, transparent 55%), var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column;
+  }
+  #content { flex: 1; min-height: 0; position: relative; }
+  .hidden { display: none !important; }
+
+  /* Project tabs */
+  #tabbar {
+    display: flex; align-items: flex-end; gap: 4px; flex: none;
+    padding: 7px 12px 0; border-bottom: 1px solid var(--border);
+    background: rgba(10,12,18,.6); backdrop-filter: blur(8px); overflow-x: auto;
+  }
+  #tabbar::-webkit-scrollbar { height: 0; }
+  .tab {
+    width: auto; display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+    background: transparent; color: var(--muted); border: 1px solid transparent;
+    border-bottom: none; border-radius: 10px 10px 0 0; padding: 8px 13px; font-size: 12.5px;
+    font-weight: 500; max-width: 220px;
+  }
+  .tab:hover { filter: none; color: var(--text); background: var(--panel-2); }
+  .tab.active { background: var(--panel); color: var(--text); border-color: var(--border); }
+  .tab .tlock { font-size: 9px; opacity: .7; }
+  .tab.active .tlock { color: var(--accent-2); opacity: 1; }
+  .tab .tname { overflow: hidden; text-overflow: ellipsis; max-width: 150px; }
+  .tab .tx { opacity: 0; color: var(--muted); font-size: 14px; line-height: 1; padding: 0 2px; border-radius: 4px; }
+  .tab:hover .tx { opacity: .7; }
+  .tab .tx:hover { opacity: 1; color: var(--danger); background: rgba(255,107,107,.12); }
+  .tab.add { color: var(--muted); font-size: 16px; padding: 8px 12px; min-width: 36px; justify-content: center; }
+  .tab.add:hover { color: var(--accent-2); }
+
+  /* Unlock */
+  #unlock { height: 100%; display: grid; place-items: center; }
+  .card {
+    width: min(92vw, 400px);
+    background: linear-gradient(180deg, var(--panel) 0%, #0e111a 100%);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 34px 30px;
+    box-shadow: 0 30px 80px rgba(0,0,0,.5);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    display: grid; place-items: center; color: #0b0d12; font-weight: 800; font-size: 18px;
+    box-shadow: 0 6px 20px rgba(124,92,255,.4);
+  }
+  .brand h1 { font-size: 20px; margin: 0; letter-spacing: .3px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 2px 0 22px; }
+  label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 7px; }
+  input[type=password], textarea {
+    width: 100%; background: #0a0c12; border: 1px solid var(--border); color: var(--text);
+    border-radius: 11px; padding: 12px 13px; font-size: 14px; font-family: var(--sans); outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(124,92,255,.18); }
+  button {
+    cursor: pointer; border: none; border-radius: 11px; font-weight: 600; font-family: var(--sans);
+    color: #0b0d12; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    padding: 12px 16px; font-size: 14px; transition: transform .08s, filter .15s; width: 100%;
+  }
+  button:hover { filter: brightness(1.07); }
+  button:active { transform: translateY(1px); }
+  button.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  button.danger { background: linear-gradient(135deg, #ff7a7a, #ff4d6d); }
+  .err { color: var(--danger); font-size: 13px; margin-top: 12px; min-height: 16px; }
+  .lock-note { color: var(--muted); font-size: 11px; margin-top: 18px; line-height: 1.5; }
+
+  /* Chat shell */
+  #chat { height: 100%; display: none; grid-template-rows: auto 1fr auto; }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 18px;
+    border-bottom: 1px solid var(--border); background: rgba(18,21,29,.7); backdrop-filter: blur(8px);
+  }
+  header .logo { width: 28px; height: 28px; font-size: 15px; border-radius: 8px; }
+  header h2 { font-size: 15px; margin: 0; }
+  .pill { font-size: 11px; color: var(--muted); border: 1px solid var(--border); padding: 3px 9px; border-radius: 999px; }
+  .pill.demo { color: var(--warn); border-color: #4a3f24; }
+  .pill.mode { color: var(--accent-2); border-color: #244a45; }
+  .spacer { flex: 1; }
+  .iconbtn {
+    width: 32px; height: 32px; padding: 0; border-radius: 9px; background: transparent;
+    color: var(--muted); border: 1px solid var(--border); font-size: 15px; line-height: 1;
+    display: grid; place-items: center;
+  }
+  .iconbtn:hover { color: var(--text); filter: none; background: var(--panel-2); }
+  .modelsel {
+    -webkit-appearance: none; appearance: none; cursor: pointer;
+    background: var(--panel-2) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' stroke='%238b93a7' stroke-width='1.5' fill='none' stroke-linecap='round'/></svg>") no-repeat right 9px center;
+    border: 1px solid var(--border); color: var(--accent-2); font-family: var(--mono);
+    font-size: 11.5px; border-radius: 999px; padding: 4px 24px 4px 11px; max-width: 240px;
+    text-overflow: ellipsis; outline: none;
+  }
+  .modelsel:hover { border-color: var(--accent); }
+  .modelsel option { background: var(--panel); color: var(--text); font-family: var(--mono); }
+
+  /* Settings modal */
+  select { -webkit-appearance: none; appearance: none; }
+  .modal.wide { width: min(94vw, 520px); text-align: left; }
+  .set-sec { border-top: 1px solid var(--border); padding: 16px 0; }
+  .set-sec:first-of-type { border-top: none; padding-top: 4px; }
+  .set-sec h4 { margin: 0 0 4px; font-size: 13px; letter-spacing: .3px; }
+  .set-sec .desc { color: var(--muted); font-size: 12px; margin: 0 0 11px; line-height: 1.5; }
+  .set-row { display: flex; gap: 10px; align-items: center; }
+  .set-row .val { font-family: var(--mono); font-size: 13px; color: var(--accent-2); flex: 1; word-break: break-all; }
+  .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .seg button { width: auto; border-radius: 0; background: transparent; color: var(--muted); padding: 8px 16px; border: none; }
+  .seg button.on { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #0b0d12; }
+  .set-row button.sm { width: auto; padding: 9px 15px; font-size: 13px; }
+  .mini-input { background: #0a0c12; border: 1px solid var(--border); color: var(--text); border-radius: 10px; padding: 10px 12px; font-size: 13px; font-family: var(--mono); flex: 1; outline: none; }
+  .ok-line { color: var(--ok); font-size: 12.5px; margin-top: 9px; min-height: 15px; }
+  .set-close { position: absolute; top: 14px; right: 16px; }
+  .modal { position: relative; }
+  .pf-note a, .pf-note { word-break: break-word; }
+
+  #messages { overflow-y: auto; padding: 22px clamp(12px, 6vw, 80px); display: flex; flex-direction: column; gap: 14px; }
+  .row { display: flex; }
+  .row.user { justify-content: flex-end; }
+  .bubble {
+    max-width: min(760px, 86%); padding: 12px 15px; border-radius: var(--radius); line-height: 1.55;
+    font-size: 14.5px; white-space: pre-wrap; word-wrap: break-word; border: 1px solid var(--border);
+  }
+  .user .bubble { background: var(--user); border-color: #2a3350; border-bottom-right-radius: 5px; }
+  .ai .bubble { background: var(--ai); border-bottom-left-radius: 5px; }
+  .meta { font-size: 11px; color: var(--muted); margin: 0 4px 5px; }
+
+  .event { align-self: flex-start; max-width: min(760px, 86%); font-family: var(--mono); font-size: 12.5px; }
+  .chip {
+    display: inline-flex; gap: 8px; align-items: center; padding: 7px 11px; border-radius: 10px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+  }
+  .chip .tname { color: var(--accent-2); }
+  .chip.err { color: var(--danger); border-color: #4a2630; }
+  .diag { background: #1c1810; border: 1px solid #40381c; color: var(--warn); padding: 9px 12px; border-radius: 10px; white-space: pre-wrap; }
+  .note { color: var(--muted); font-size: 12px; font-style: italic; }
+  .errline { color: var(--danger); font-size: 13px; }
+
+  /* Live reasoning / "thinking" panel */
+  .think { align-self: flex-start; max-width: min(760px, 86%); margin: 2px 0; }
+  .think summary {
+    cursor: pointer; color: var(--muted); font-size: 12px; font-family: var(--mono);
+    list-style: none; display: inline-flex; gap: 6px; align-items: center; user-select: none;
+    padding: 3px 0;
+  }
+  .think summary::-webkit-details-marker { display: none; }
+  .think .chev { display: inline-block; transition: transform .15s; font-size: 10px; }
+  .think[open] .chev { transform: rotate(90deg); }
+  .think .tbody {
+    margin-top: 6px; padding: 9px 12px; border-left: 2px solid var(--accent);
+    color: var(--muted); font-size: 12.5px; line-height: 1.5; white-space: pre-wrap;
+    background: rgba(124,92,255,.05); border-radius: 0 8px 8px 0; max-height: 320px; overflow-y: auto;
+  }
+  .think.live summary .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: blink 1s infinite; }
+  .bubble.reasoning-only { color: var(--muted); font-style: italic; }
+
+  .typing { display: inline-flex; gap: 4px; padding: 10px 14px; }
+  .typing i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); animation: blink 1.2s infinite; }
+  .typing i:nth-child(2){ animation-delay:.2s } .typing i:nth-child(3){ animation-delay:.4s }
+  @keyframes blink { 0%,60%,100%{opacity:.25} 30%{opacity:1} }
+
+  footer { border-top: 1px solid var(--border); padding: 12px clamp(12px, 6vw, 80px); background: rgba(13,15,21,.7); }
+  .composer { display: flex; gap: 10px; align-items: flex-end; }
+  .composer textarea { resize: none; min-height: 46px; max-height: 180px; }
+  .composer button { width: auto; padding: 12px 20px; }
+  .hint { color: var(--muted); font-size: 11px; margin-top: 7px; }
+
+  /* Permission modal */
+  #overlay { position: fixed; inset: 0; background: rgba(5,6,10,.6); display: grid; place-items: center; backdrop-filter: blur(3px); }
+  .modal { width: min(92vw, 460px); background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 22px; box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+  .modal h3 { margin: 0 0 6px; font-size: 16px; }
+  .modal .detail { font-family: var(--mono); font-size: 13px; background: #0a0c12; border: 1px solid var(--border); border-radius: 10px; padding: 11px 12px; color: var(--accent-2); margin: 12px 0 18px; word-break: break-all; }
+  .modal .actions { display: flex; gap: 10px; }
+  ::-webkit-scrollbar { width: 10px; } ::-webkit-scrollbar-thumb { background: #232838; border-radius: 8px; }
+</style>
+</head>
+<body>
+  <!-- Project tabs (rendered by JS) -->
+  <nav id="tabbar" class="hidden"></nav>
+
+  <div id="content">
+  <!-- Auth: create vault / unlock / connect model (rendered by JS) -->
+  <section id="unlock">
+    <div class="card" id="authCard"></div>
+  </section>
+
+  <!-- Chat -->
+  <section id="chat">
+    <header>
+      <div class="logo">A</div>
+      <h2>AnonCode</h2>
+      <span class="pill" id="providerPill">—</span>
+      <select class="modelsel hidden" id="modelSelect" title="Switch model"></select>
+      <span class="pill mode hidden" id="modePill">build</span>
+      <span class="pill demo hidden" id="demoPill">demo</span>
+      <div class="spacer"></div>
+      <span class="pill" id="statusPill">locked</span>
+      <button class="iconbtn" id="gearBtn" title="Settings" aria-label="Settings">⚙</button>
+    </header>
+    <div id="messages"></div>
+    <footer>
+      <form class="composer" id="composer">
+        <textarea id="input" placeholder="Ask AnonCode to build something…" rows="1"></textarea>
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+      <div class="hint">Enter to send · Shift+Enter for a new line · all activity stays encrypted on this machine</div>
+    </footer>
+  </section>
+  </div><!-- /content -->
+
+  <!-- Settings overlay -->
+  <div id="settings" class="hidden" style="position:fixed;inset:0;background:rgba(5,6,10,.6);display:grid;place-items:center;backdrop-filter:blur(3px);z-index:5">
+    <div class="modal wide">
+      <button class="iconbtn set-close" id="setClose" aria-label="Close">✕</button>
+      <h3 style="margin:0 0 14px">Settings</h3>
+      <div id="setBody"></div>
+    </div>
+  </div>
+
+  <!-- Permission overlay -->
+  <div id="overlay" class="hidden">
+    <div class="modal">
+      <h3>Permission needed</h3>
+      <div>AnonCode wants to <b id="permAction">run</b> — allow it?</div>
+      <div class="detail" id="permDetail"></div>
+      <div class="actions">
+        <button class="danger" id="permDeny" style="flex:1">Deny</button>
+        <button id="permAllow" style="flex:1">Allow</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const api = (path, opts = {}) => fetch(path, {
+  ...opts,
+  headers: { "content-type": "application/json", "x-anoncode-token": token, ...(opts.headers || {}) },
+});
+
+const $ = (id) => document.getElementById(id);
+const messages = $("messages");
+let busy = false, typingEl = null;
+
+function scrollDown() { messages.scrollTop = messages.scrollHeight; }
+
+function addBubble(role, text) {
+  const row = document.createElement("div");
+  row.className = "row " + role;
+  const wrap = document.createElement("div");
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  meta.textContent = role === "user" ? "you" : "AnonCode";
+  const b = document.createElement("div");
+  b.className = "bubble";
+  b.textContent = text;
+  wrap.appendChild(meta); wrap.appendChild(b);
+  row.appendChild(wrap);
+  messages.appendChild(row);
+  scrollDown();
+  return b;
+}
+function addEvent(html, cls) {
+  const d = document.createElement("div");
+  d.className = "event";
+  d.innerHTML = '<div class="' + cls + '">' + html + '</div>';
+  messages.appendChild(d); scrollDown();
+}
+function esc(s){ return (s||"").replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function showTyping() {
+  if (typingEl) return;
+  typingEl = document.createElement("div");
+  typingEl.className = "row ai";
+  typingEl.innerHTML = '<div class="typing"><i></i><i></i><i></i></div>';
+  messages.appendChild(typingEl); scrollDown();
+}
+function hideTyping() { if (typingEl) { typingEl.remove(); typingEl = null; } }
+
+function setStatus(t) { $("statusPill").textContent = t; }
+
+const authCard = $("authCard");
+const ACCENT = "color:var(--accent-2)";
+function setCard(bodyHtml) {
+  authCard.innerHTML = '<div class="brand"><div class="logo">A</div><h1>AnonCode</h1></div>' + bodyHtml;
+  const f = authCard.querySelector("input,select");
+  if (f) f.focus();
+}
+function authErr(msg) { const e = $("authErr"); if (e) { e.style.color = "var(--danger)"; e.textContent = msg; } }
+function onForm(fn) { authCard.querySelector("form").addEventListener("submit", (e) => { e.preventDefault(); fn(); }); }
+function showOffline(html) { setCard('<div class="sub">Private, encrypted coding agent</div><div class="err" style="color:var(--muted)">' + html + '</div>'); }
+
+function handleState(s) {
+  if (s.demo) $("demoPill").classList.remove("hidden");
+  renderTabs(s);
+  if (s.unlocked && (s.hasProvider || s.demo)) return startChat(s);
+  if (s.unlocked) { authView(); return showProvider(); }
+  if (!s.hasVault) { authView(); return showCreate(); }
+  authView(); return showUnlock();
+}
+
+// Reveal the auth view (create/unlock/connect) and hide the chat.
+function authView() { $("chat").style.display = "none"; $("unlock").classList.remove("hidden"); }
+
+// ---- project tabs ----------------------------------------------------------
+function renderTabs(s) {
+  const bar = $("tabbar");
+  if (!s.projects || s.demo) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  bar.innerHTML = s.projects.map((p) =>
+    '<button class="tab' + (p.id === s.activeProject ? " active" : "") + '" data-id="' + p.id + '">' +
+      '<span class="tlock" title="' + (p.unlocked ? "unlocked" : "locked") + '">' + (p.unlocked ? "●" : "○") + '</span>' +
+      '<span class="tname">' + esc(p.name) + '</span>' +
+      (p.legacy ? "" : '<span class="tx" data-del="' + p.id + '" title="Delete project">×</span>') +
+    '</button>'
+  ).join("") + '<button class="tab add" id="tabAdd" title="New project">+</button>';
+  bar.querySelectorAll(".tab[data-id]").forEach((t) => {
+    t.addEventListener("click", (e) => {
+      if (e.target.classList.contains("tx")) return;
+      if (t.classList.contains("active")) return;
+      selectProject(t.getAttribute("data-id"));
+    });
+    t.addEventListener("dblclick", () => renameProjectTab(t.getAttribute("data-id"), s));
+  });
+  bar.querySelectorAll(".tx").forEach((x) => x.addEventListener("click", (e) => { e.stopPropagation(); delProject(x.getAttribute("data-del"), s); }));
+  $("tabAdd").addEventListener("click", addProject);
+}
+async function selectProject(id) {
+  const res = await api("/api/project/select", { method: "POST", body: JSON.stringify({ id }) });
+  const s = await res.json().catch(() => ({}));
+  if (res.ok && !s.error) handleState(s);
+}
+async function addProject() {
+  const name = (prompt("Name this project:", "New project") || "").trim();
+  if (name === "") return;
+  const res = await api("/api/project/create", { method: "POST", body: JSON.stringify({ name }) });
+  const s = await res.json().catch(() => ({}));
+  if (res.ok && !s.error) handleState(s); // new project → create-vault screen
+}
+async function renameProjectTab(id, s) {
+  const cur = (s.projects.find((p) => p.id === id) || {}).name || "";
+  const name = (prompt("Rename project:", cur) || "").trim();
+  if (!name || name === cur) return;
+  const res = await api("/api/project/rename", { method: "POST", body: JSON.stringify({ id, name }) });
+  const ns = await res.json().catch(() => ({}));
+  if (res.ok && !ns.error) handleState(ns);
+}
+async function delProject(id, s) {
+  const p = (s.projects || []).find((x) => x.id === id) || {};
+  if (!confirm('Permanently delete project "' + (p.name || id) + '" and all its encrypted data? This cannot be undone.')) return;
+  const res = await api("/api/project/delete", { method: "POST", body: JSON.stringify({ id }) });
+  const ns = await res.json().catch(() => ({}));
+  if (res.ok && !ns.error) handleState(ns);
+}
+
+async function init() {
+  if (location.protocol === "file:")
+    return showOffline("This is a web app, not a file to open. Start it with <b style='" + ACCENT + "'>anoncode gui</b> — it opens the right URL for you.");
+  if (!token)
+    return showOffline("Missing access token — open the exact URL that <b style='" + ACCENT + "'>anoncode gui</b> printed.");
+  let s;
+  try { s = await api("/api/state").then((r) => r.json()); }
+  catch { return showOffline("Can't reach the AnonCode server. Start it with <b style='" + ACCENT + "'>anoncode gui</b>, then open the printed URL."); }
+  handleState(s);
+}
+init();
+
+function showCreate() {
+  setCard(
+    '<div class="sub">Welcome — create your encrypted vault</div>' +
+    '<form>' +
+    '<label>Choose a passphrase</label><input id="p1" type="password" autocomplete="new-password" placeholder="At least 8 characters" />' +
+    '<div style="height:12px"></div>' +
+    '<label>Confirm passphrase</label><input id="p2" type="password" autocomplete="new-password" placeholder="Repeat it" />' +
+    '<div style="height:14px"></div><button type="submit">Create vault</button></form>' +
+    '<div class="err" id="authErr"></div>' +
+    '<div class="lock-note">This passphrase encrypts everything — chats and project files — at rest. It never leaves this machine and cannot be recovered, so keep it safe.</div>'
+  );
+  onForm(async () => {
+    const p1 = $("p1").value, p2 = $("p2").value;
+    if (p1.length < 8) return authErr("Passphrase must be at least 8 characters.");
+    if (p1 !== p2) return authErr("Passphrases do not match.");
+    const res = await api("/api/init", { method: "POST", body: JSON.stringify({ passphrase: p1 }) });
+    const s = await res.json().catch(() => ({}));
+    if (!res.ok || s.error) return authErr(s.error || "Could not create vault.");
+    handleState(s);
+  });
+}
+
+function showUnlock() {
+  setCard(
+    '<div class="sub">Unlock your vault</div>' +
+    '<form><label>Passphrase</label><input id="p1" type="password" autocomplete="current-password" placeholder="Your passphrase" />' +
+    '<div style="height:14px"></div><button type="submit">Unlock</button></form>' +
+    '<div class="err" id="authErr"></div>' +
+    '<div class="lock-note">Everything is encrypted at rest with a key derived from this passphrase. There is no backdoor.</div>'
+  );
+  onForm(async () => {
+    const res = await api("/api/unlock", { method: "POST", body: JSON.stringify({ passphrase: $("p1").value }) });
+    const s = await res.json().catch(() => ({}));
+    if (!res.ok || s.error) return authErr(s.error || "Could not unlock.");
+    handleState(s);
+  });
+}
+
+// ---- provider catalog + reusable connect form ------------------------------
+let catalog = null;
+async function loadCatalog() {
+  if (catalog) return catalog;
+  try { catalog = (await api("/api/catalog").then((r) => r.json())).presets || []; }
+  catch { catalog = []; }
+  return catalog;
+}
+function matchesPreset(p, cur) {
+  return cur && p.kind === cur.kind && (p.baseUrl || "") === (cur.baseUrl || "");
+}
+
+/**
+ * Render the "connect a model" form into `mount`. opts: { current, saveLabel,
+ * showCancel, onDone, onCancel }. Handles presets, model suggestions, key
+ * validation, and a "save without testing" fallback.
+ */
+async function buildProviderForm(mount, opts = {}) {
+  const presets = await loadCatalog();
+  if (!presets.length) { mount.innerHTML = '<div class="err">Could not load the provider list.</div>'; return; }
+  const cur = opts.current || {};
+  const inp = "width:100%;background:#0a0c12;border:1px solid var(--border);color:var(--text);border-radius:11px;padding:11px 12px;font-size:14px;font-family:var(--sans);outline:none";
+  const dlId = "pf-models-" + Math.random().toString(36).slice(2, 7);
+  mount.innerHTML =
+    '<label>Provider</label>' +
+    '<select class="pf-preset" style="' + inp + '">' +
+      presets.map((p) => '<option value="' + p.id + '">' + esc(p.label) + '</option>').join('') + '</select>' +
+    '<div style="height:12px"></div>' +
+    '<label>Model <span class="pf-fetch" style="cursor:pointer;color:var(--accent-2);opacity:.85">↻ load from provider</span> <span class="pf-mcount" style="opacity:.55"></span></label>' +
+    '<input class="pf-model" list="' + dlId + '" style="' + inp + '" placeholder="model name" />' +
+    '<datalist id="' + dlId + '"></datalist>' +
+    '<div style="height:12px"></div>' +
+    '<div class="pf-keywrap"><label>API key <span class="pf-keyopt" style="opacity:.55"></span></label>' +
+      '<input class="pf-key" type="password" autocomplete="off" style="' + inp + '" /><div style="height:12px"></div></div>' +
+    '<div class="pf-basewrap"><label>Base URL</label>' +
+      '<input class="pf-base" type="text" style="' + inp + '" /><div style="height:12px"></div></div>' +
+    '<div class="pf-note" style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.5"></div>' +
+    '<button class="pf-save" type="button">' + (opts.saveLabel || 'Save &amp; start') + '</button>' +
+    '<div class="pf-skip" style="display:none;margin-top:9px"><button class="pf-skipbtn ghost" type="button">Save without testing</button></div>' +
+    (opts.showCancel ? '<div style="height:9px"></div><button class="pf-cancel ghost" type="button">Cancel</button>' : '') +
+    '<div class="err pf-err" style="margin-top:12px"></div>' +
+    '<div class="lock-note">Your API key is sealed in the encrypted vault, never written in plaintext. AnonCode sends one tiny test request to confirm it works.</div>';
+
+  const q = (s) => mount.querySelector(s);
+  const presetSel = q(".pf-preset"), modelInp = q(".pf-model"), keyInp = q(".pf-key"),
+    baseInp = q(".pf-base"), noteEl = q(".pf-note"), dl = q("#" + dlId),
+    keyWrap = q(".pf-keywrap"), baseWrap = q(".pf-basewrap"), errEl = q(".pf-err"),
+    saveBtn = q(".pf-save"), skipWrap = q(".pf-skip");
+
+  function applyPreset(p, keepValues) {
+    dl.innerHTML = p.models.map((m) => '<option value="' + esc(m) + '"></option>').join('');
+    if (!keepValues) modelInp.value = p.models[0] || "";
+    baseWrap.style.display = p.kind === "anthropic" ? "none" : "block";
+    if (!keepValues) baseInp.value = p.baseUrl || "";
+    keyInp.placeholder = p.keyHint || (p.needsKey ? "your API key" : "");
+    q(".pf-keyopt").textContent = p.needsKey ? "" : "(blank for local / keyless)";
+    const bits = [];
+    if (p.note) bits.push(esc(p.note));
+    if (p.keysUrl) bits.push('Get a key at ' + esc(p.keysUrl));
+    noteEl.innerHTML = bits.join('<br>');
+  }
+
+  // Pick the preset matching the current config, else the first.
+  const initial = presets.find((p) => matchesPreset(p, cur)) || presets[0];
+  presetSel.value = initial.id;
+  applyPreset(initial, false);
+  if (cur.model) { modelInp.value = cur.model; }
+  if (cur.baseUrl && initial.kind !== "anthropic") baseInp.value = cur.baseUrl;
+  // If editing the current provider (key already saved) or a keyless local one, load its models now.
+  if ((matchesPreset(initial, cur) && cur.model) || !initial.needsKey) loadModels();
+
+  // Pull the real model list from the provider's API and fill the datalist.
+  async function loadModels() {
+    const p = presets.find((x) => x.id === presetSel.value);
+    const mcount = q(".pf-mcount");
+    // Need a key, unless this is the already-saved provider (server reuses it).
+    const savedMatch = matchesPreset(p, cur) && !!cur.model;
+    if (p.needsKey && !keyInp.value.trim() && !savedMatch) { mcount.textContent = "(enter a key to load)"; return; }
+    mcount.textContent = "loading…";
+    const { models, error } = await fetchModels({
+      kind: p.kind, baseUrl: p.kind === "anthropic" ? "" : baseInp.value.trim(), apiKey: keyInp.value,
+    });
+    if (models && models.length) {
+      dl.innerHTML = models.map((m) => '<option value="' + esc(m) + '"></option>').join("");
+      mcount.textContent = "(" + models.length + " available)";
+      if (!modelInp.value.trim()) modelInp.value = models[0];
+    } else {
+      mcount.textContent = error ? "(couldn't load — type one)" : "(none found)";
+    }
+  }
+  q(".pf-fetch").addEventListener("click", loadModels);
+  keyInp.addEventListener("blur", () => { if (keyInp.value.trim()) loadModels(); });
+
+  presetSel.addEventListener("change", () => {
+    skipWrap.style.display = "none"; errEl.textContent = "";
+    const p = presets.find((x) => x.id === presetSel.value);
+    applyPreset(p, false);
+    q(".pf-mcount").textContent = "";
+    if (!p.needsKey) loadModels(); // keyless/local: fetch immediately
+    modelInp.focus();
+  });
+
+  async function doSave(test) {
+    errEl.style.color = "var(--danger)"; errEl.textContent = "";
+    const p = presets.find((x) => x.id === presetSel.value);
+    const model = modelInp.value.trim();
+    if (!model) { errEl.textContent = "Model is required."; return; }
+    const body = {
+      kind: p.kind, model, apiKey: keyInp.value,
+      baseUrl: p.kind === "anthropic" ? "" : baseInp.value.trim(),
+      test: test !== false,
+    };
+    saveBtn.disabled = true;
+    const orig = saveBtn.innerHTML;
+    saveBtn.innerHTML = test === false ? "Saving…" : "Testing connection…";
+    let res, s;
+    try { res = await api("/api/provider", { method: "POST", body: JSON.stringify(body) }); s = await res.json().catch(() => ({})); }
+    catch { s = { error: "Couldn't reach the server." }; }
+    saveBtn.disabled = false; saveBtn.innerHTML = orig;
+    if (!res || !res.ok || s.error) {
+      errEl.textContent = s.error || "Could not save provider.";
+      if (s.testFailed) skipWrap.style.display = "block";
+      return;
+    }
+    skipWrap.style.display = "none";
+    if (opts.onDone) opts.onDone(s); else handleState(s);
+  }
+  saveBtn.addEventListener("click", () => doSave(true));
+  q(".pf-skipbtn").addEventListener("click", () => doSave(false));
+  if (opts.showCancel) q(".pf-cancel").addEventListener("click", () => opts.onCancel && opts.onCancel());
+  modelInp.focus();
+}
+
+function showProvider() {
+  setCard('<div class="sub">Connect an AI model</div><div id="pfMount"></div>');
+  buildProviderForm($("pfMount"), { onDone: (s) => handleState(s) });
+}
+
+let lastState = {};
+async function fetchModels(payload) {
+  try { return await api("/api/models", { method: "POST", body: JSON.stringify(payload || {}) }).then((r) => r.json()); }
+  catch { return { models: [], error: "Couldn't reach the server." }; }
+}
+function fillModelSelect(sel, models, current) {
+  const list = (models || []).slice();
+  if (current && !list.includes(current)) list.unshift(current);
+  sel.innerHTML = list.map((m) => '<option value="' + esc(m) + '"' + (m === current ? " selected" : "") + ">" + esc(m) + "</option>").join("");
+}
+function applyHeader(info) {
+  lastState = info;
+  $("providerPill").textContent = info.provider || "no provider";
+  const sel = $("modelSelect");
+  if (info.provider && info.model && !info.demo) {
+    sel.classList.remove("hidden");
+    if (![...sel.options].some((o) => o.value === info.model)) {
+      const opt = document.createElement("option"); opt.value = info.model; opt.textContent = info.model; sel.appendChild(opt);
+    }
+    sel.value = info.model;
+  } else { sel.classList.add("hidden"); }
+  const mp = $("modePill");
+  mp.textContent = info.mode || "build";
+  mp.classList.toggle("hidden", !(info.mode === "plan"));
+  if (info.demo) $("demoPill").classList.remove("hidden");
+}
+async function refreshHeaderModels() {
+  if (lastState.demo || !lastState.provider) return;
+  const { models } = await fetchModels({});
+  if (models && models.length) fillModelSelect($("modelSelect"), models, lastState.model);
+}
+$("modelSelect").addEventListener("change", async () => {
+  const model = $("modelSelect").value;
+  if (model === lastState.model) return;
+  setStatus("switching model…");
+  const r = await api("/api/model", { method: "POST", body: JSON.stringify({ model }) });
+  const s = await r.json().catch(() => ({}));
+  if (r.ok && !s.error) { applyHeader(s); setStatus("ready"); addEvent("switched to " + esc(model), "note"); }
+  else { setStatus("ready"); applyHeader(lastState); addEvent("✖ " + esc(s.error || "couldn't switch model"), "errline"); }
+});
+let shownProject = null;
+function startChat(info) {
+  $("unlock").classList.add("hidden");
+  $("chat").style.display = "grid";
+  // Switching to a different project: clear the previous project's transcript.
+  if (info.activeProject !== shownProject) {
+    messages.innerHTML = ""; think = null; liveBubble = null;
+    $("modelSelect").innerHTML = "";
+    shownProject = info.activeProject;
+  }
+  applyHeader(info);
+  setStatus("ready");
+  connectEvents();
+  refreshHeaderModels();
+  $("input").focus();
+}
+
+// ---- settings panel --------------------------------------------------------
+$("gearBtn").addEventListener("click", openSettings);
+$("setClose").addEventListener("click", () => $("settings").classList.add("hidden"));
+// Close only via the ✕ or Escape — never on an outside click, so dismissing a
+// native dropdown (or a stray click) doesn't nuke the whole panel.
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("settings").classList.contains("hidden")) $("settings").classList.add("hidden");
+});
+
+async function openSettings() {
+  let s;
+  try { s = await api("/api/state").then((r) => r.json()); } catch { s = lastState; }
+  applyHeader(s);
+  renderSettings(s);
+  $("settings").classList.remove("hidden");
+}
+
+function renderSettings(s) {
+  const body = $("setBody");
+  if (s.demo) {
+    body.innerHTML = '<div class="desc">Demo mode uses a throwaway vault and a mock model, so settings are disabled. Run <b style="color:var(--accent-2)">anoncode gui</b> (without --demo) to configure a real model.</div>';
+    return;
+  }
+  body.innerHTML =
+    '<div class="set-sec"><h4>Model</h4><div class="desc">The AI provider and model AnonCode talks to.</div>' +
+      '<div class="set-row"><div class="val" id="setModel">' + esc((s.provider || "none") + " / " + (s.model || "—")) + '</div>' +
+      '<button class="sm ghost" id="setChange">Change</button></div></div>' +
+    '<div class="set-sec"><h4>Agent mode</h4><div class="desc"><b>Build</b> can edit files and run commands. <b>Plan</b> is read-only — it can look but not change anything.</div>' +
+      '<div class="seg" id="setMode"><button data-m="build"' + (s.mode !== "plan" ? ' class="on"' : '') + '>Build</button>' +
+      '<button data-m="plan"' + (s.mode === "plan" ? ' class="on"' : '') + '>Plan</button></div></div>' +
+    '<div class="set-sec"><h4>Permissions</h4><div class="desc"><b>Ask</b> prompts before each command or risky action. <b>Auto</b> approves them automatically (still shown in the log) — no more repeated prompts.</div>' +
+      '<div class="seg" id="setPerm"><button data-p="ask"' + (s.permissionMode !== "auto" ? ' class="on"' : '') + '>Ask</button>' +
+      '<button data-p="auto"' + (s.permissionMode === "auto" ? ' class="on"' : '') + '>Auto</button></div></div>' +
+    '<div class="set-sec"><h4>Export project</h4><div class="desc">Decrypt the ' + (s.fileCount || 0) + ' project file(s) to a real folder (plaintext) — for building or pushing to GitHub. This is the only thing that writes unencrypted data.</div>' +
+      '<div class="set-row"><input class="mini-input" id="setExportDir" placeholder="./out (folder path)" /><button class="sm" id="setExport">Export</button></div>' +
+      '<div class="ok-line" id="setExportMsg"></div></div>' +
+    '<div class="set-sec"><h4>Security</h4><div class="desc">Lock the vault to wipe the in-memory key and the temporary runspace. You\'ll need your passphrase to get back in.</div>' +
+      '<button class="danger" id="setLock">Lock vault</button></div>';
+
+  $("setChange").addEventListener("click", () => {
+    body.innerHTML = '<div class="desc" style="margin-bottom:12px">Connect a different model.</div><div id="setPf"></div>';
+    buildProviderForm($("setPf"), {
+      current: { kind: s.kind, baseUrl: s.baseUrl, model: s.model },
+      saveLabel: "Save",
+      showCancel: true,
+      onDone: (ns) => { applyHeader(ns); renderSettings(ns); },
+      onCancel: () => renderSettings(s),
+    });
+  });
+
+  $("setMode").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const mode = btn.getAttribute("data-m");
+    if (mode === (s.mode || "build")) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ mode }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) { applyHeader(ns); renderSettings(ns); }
+  }));
+
+  $("setPerm").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const permissionMode = btn.getAttribute("data-p");
+    if (permissionMode === (s.permissionMode || "ask")) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ permissionMode }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) renderSettings(ns);
+  }));
+
+  $("setExport").addEventListener("click", async () => {
+    const dir = $("setExportDir").value.trim();
+    const msg = $("setExportMsg");
+    msg.style.color = "var(--muted)"; msg.textContent = "Exporting…";
+    const res = await api("/api/export", { method: "POST", body: JSON.stringify({ dir }) });
+    const r = await res.json().catch(() => ({}));
+    if (res.ok && r.ok) { msg.style.color = "var(--ok)"; msg.textContent = "Exported " + r.count + " file(s) to " + r.dir; }
+    else { msg.style.color = "var(--danger)"; msg.textContent = r.error || "Export failed."; }
+  });
+
+  $("setLock").addEventListener("click", async () => {
+    await api("/api/lock", { method: "POST" }).catch(() => {});
+    location.reload();
+  });
+}
+
+// Streaming state for the current turn.
+let liveBubble = null;   // the assistant bubble currently being streamed into
+let think = null;        // { el, body, label } the current turn's thinking panel
+
+function ensureThink() {
+  if (think) return think;
+  const d = document.createElement("details");
+  d.className = "think live"; d.open = true;
+  d.innerHTML = '<summary><span class="chev">▸</span><span class="dot"></span> <span class="tlabel">thinking…</span></summary><div class="tbody"></div>';
+  messages.appendChild(d); scrollDown();
+  think = { el: d, body: d.querySelector(".tbody"), label: d.querySelector(".tlabel") };
+  return think;
+}
+function appendThink(text) { const t = ensureThink(); t.body.textContent += text; scrollDown(); }
+function endThink() {
+  if (!think) return;
+  think.el.classList.remove("live");
+  think.label.textContent = "thoughts";
+  think.el.open = false;
+  think = null;
+}
+function ensureLive() {
+  if (liveBubble) return liveBubble;
+  hideTyping();
+  liveBubble = addBubble("ai", "");
+  return liveBubble;
+}
+function appendLive(text) { const b = ensureLive(); b.textContent += text; scrollDown(); }
+function finalizeLive() { liveBubble = null; }
+
+let eventSource = null;
+function connectEvents() {
+  if (eventSource) return; // one shared stream for the whole GUI
+  const es = new EventSource("/api/stream?t=" + encodeURIComponent(token));
+  eventSource = es;
+  es.onmessage = (ev) => {
+    const e = JSON.parse(ev.data);
+    if (e.type === "note") addEvent(esc(e.text), "note");
+    else if (e.type === "reasoning") { appendThink(e.text); }
+    else if (e.type === "assistant_delta") { appendLive(e.text); }
+    else if (e.type === "tool_call") { finalizeLive(); addEvent('⚙ <span class="tname">' + esc(e.tool) + '</span> <span class="chip">' + esc(JSON.stringify(e.args).slice(0,100)) + '</span>', ""); showTyping(); }
+    else if (e.type === "tool_result") { addEvent('<span class="chip ' + (e.ok ? "" : "err") + '">⤷ ' + (e.ok ? "ok" : "err") + ": " + esc((e.output||"").split("\n")[0].slice(0,120)) + "</span>", ""); }
+    else if (e.type === "diagnostics") { hideTyping(); addEvent(esc(e.text), "diag"); showTyping(); }
+    else if (e.type === "assistant_final") {
+      hideTyping();
+      if (e.reasoningOnly) {
+        finalizeLive();
+        const b = addBubble("ai", "The model put its full response in its reasoning — see the thinking above.");
+        b.classList.add("reasoning-only");
+      } else if (liveBubble) {
+        if (e.text) liveBubble.textContent = e.text; // reconcile with authoritative text
+        finalizeLive();
+      } else if (e.text) {
+        const b = addBubble("ai", e.text);
+        if (e.note) b.classList.add("reasoning-only");
+      }
+    }
+    else if (e.type === "error") { hideTyping(); finalizeLive(); addEvent("✖ " + esc(e.text), "errline"); }
+    else if (e.type === "turn_done") { busy = false; hideTyping(); endThink(); finalizeLive(); setStatus("ready"); $("sendBtn").disabled = false; }
+    else if (e.type === "permission") showPermission(e);
+  };
+  es.onerror = () => setStatus("reconnecting…");
+}
+
+$("composer").addEventListener("submit", (e) => { e.preventDefault(); send(); });
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("input").addEventListener("input", (e) => {
+  e.target.style.height = "auto"; e.target.style.height = Math.min(e.target.scrollHeight, 180) + "px";
+});
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text || busy) return;
+  busy = true; $("sendBtn").disabled = true; setStatus("thinking…");
+  addBubble("user", text);
+  $("input").value = ""; $("input").style.height = "auto";
+  showTyping();
+  const r = await api("/api/message", { method: "POST", body: JSON.stringify({ text }) });
+  if (!r.ok) { hideTyping(); addEvent("✖ request failed", "errline"); busy = false; $("sendBtn").disabled = false; setStatus("ready"); }
+}
+
+let permId = null;
+function showPermission(e) {
+  permId = e.id;
+  $("permAction").textContent = e.action + (e.detail ? "" : "");
+  $("permDetail").textContent = e.detail;
+  $("overlay").classList.remove("hidden");
+}
+function answerPermission(allow) {
+  $("overlay").classList.add("hidden");
+  api("/api/permission", { method: "POST", body: JSON.stringify({ id: permId, allow }) });
+  permId = null;
+}
+$("permAllow").addEventListener("click", () => answerPermission(true));
+$("permDeny").addEventListener("click", () => answerPermission(false));
+</script>
+</body>
+</html>
