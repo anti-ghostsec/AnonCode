@@ -761,6 +761,11 @@ function renderSettings(s) {
     '<div class="set-sec"><h4>Export project</h4><div class="desc">Decrypt the ' + (s.fileCount || 0) + ' project file(s) to a real folder (plaintext) — for building or pushing to GitHub. This is the only thing that writes unencrypted data.</div>' +
       '<div class="set-row"><input class="mini-input" id="setExportDir" placeholder="./out (folder path)" /><button class="sm" id="setExport">Export</button></div>' +
       '<div class="ok-line" id="setExportMsg"></div></div>' +
+    '<div class="set-sec"><h4>Project memory</h4><div class="desc">Lessons AnonCode distills from reviewer corrections — stored encrypted and reused on later turns so it stops repeating mistakes.</div>' +
+      '<div class="seg" id="setMem"><button data-mem="on"' + (!s.memory || s.memory.enabled ? ' class="on"' : '') + '>Auto-learn</button>' +
+      '<button data-mem="off"' + (s.memory && !s.memory.enabled ? ' class="on"' : '') + '>Off</button></div>' +
+      '<div id="setMemList" class="desc" style="margin-top:10px">loading…</div>' +
+      '<div class="set-row" style="margin-top:8px"><div></div><button class="sm ghost" id="setMemClear">Clear all</button></div></div>' +
     '<div class="set-sec"><h4>History</h4><div class="desc">AnonCode checkpoints the project (encrypted, in-vault) before each change. Undo reverts the most recent change — it walks back one turn at a time.</div>' +
       '<div class="set-row"><div class="val" id="setSnapCount">checking…</div><button class="sm ghost" id="setUndo">Undo last change</button></div>' +
       '<div class="ok-line" id="setUndoMsg"></div></div>' +
@@ -774,6 +779,36 @@ function renderSettings(s) {
       if (el) el.textContent = snaps.length ? snaps.length + " checkpoint(s)" : "no checkpoints yet";
     } catch {}
   })();
+
+  async function loadMemList() {
+    const el = $("setMemList");
+    if (!el) return;
+    const mem = (await api("/api/memory").then((r) => r.json()).catch(() => ({ memory: [] }))).memory || [];
+    if (!mem.length) { el.innerHTML = '<span style="opacity:.6">No lessons yet — they accumulate as the reviewer corrects the agent.</span>'; return; }
+    el.innerHTML = mem.slice(0, 12).map((m) =>
+      '<div style="display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--border)">' +
+      '<span style="flex:1;color:var(--text);font-size:13px">' + esc(m.text) + ' <span style="opacity:.45">(' + esc(m.source) + ')</span></span>' +
+      '<button class="memdel" data-id="' + esc(m.id) + '" title="forget" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:15px">×</button></div>'
+    ).join("");
+    el.querySelectorAll(".memdel").forEach((b) => b.addEventListener("click", async () => {
+      await api("/api/memory/delete", { method: "POST", body: JSON.stringify({ id: b.getAttribute("data-id") }) });
+      loadMemList();
+    }));
+  }
+  loadMemList();
+
+  $("setMem").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const on = btn.getAttribute("data-mem") === "on";
+    if (on === (!s.memory || s.memory.enabled)) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ memory: on }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) renderSettings(ns);
+  }));
+
+  $("setMemClear").addEventListener("click", async () => {
+    await api("/api/memory/clear", { method: "POST" }).catch(() => {});
+    loadMemList();
+  });
 
   $("setUndo").addEventListener("click", async () => {
     const msg = $("setUndoMsg");

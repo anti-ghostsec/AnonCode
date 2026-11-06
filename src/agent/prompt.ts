@@ -11,6 +11,9 @@ export function buildAgentPrompt(opts: {
   fs: AgentFS;
   registry: ToolRegistry;
   mode: "build" | "plan";
+  /** Durable lessons from earlier in this project (the encrypted memory), so the
+   * agent doesn't repeat past mistakes. Injected verbatim, bounded by caller. */
+  memories?: string[];
   now?: Date;
 }): string {
   const { fs, registry, mode } = opts;
@@ -55,8 +58,17 @@ reply normally in prose with NO tool block.
 Available tools:
 ${toolDocs}`;
 
+  let prompt = base;
+
+  const memories = (opts.memories ?? []).filter((m) => m.trim());
+  if (memories.length) {
+    prompt += `\n\nLessons learned earlier in this project (apply them; don't repeat these mistakes):\n` +
+      memories.map((m) => `  - ${m.trim()}`).join("\n");
+  }
+
   const rules = readRules(fs);
-  return rules ? `${base}\n\nProject rules (${rules.name}):\n${rules.text}` : base;
+  if (rules) prompt += `\n\nProject rules (${rules.name}):\n${rules.text}`;
+  return prompt;
 }
 
 /** Read the project rules file from the ENCRYPTED project filesystem. */

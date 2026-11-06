@@ -25,6 +25,7 @@ import type { Session, ContentPart } from "../session/types.ts";
 import { EncryptedFS } from "../vfs/efs.ts";
 import { Runspace } from "../vfs/runspace.ts";
 import { SnapshotStore } from "../vfs/snapshots.ts";
+import { MemoryStore } from "../agent/memory.ts";
 import { defaultTools, type ToolRegistry } from "../tools/registry.ts";
 import type { ToolContext } from "../tools/types.ts";
 import { NoDiagnostics, CommandDiagnostics, type DiagnosticsProvider } from "../tools/diagnostics.ts";
@@ -59,6 +60,7 @@ type Unlocked = {
   sessions: SessionStore;
   session: Session;
   snapshots: SnapshotStore;
+  memory: MemoryStore;
   config: ReturnType<typeof loadConfig>;
 };
 
@@ -154,6 +156,10 @@ export class GuiServer {
       if (path === "/api/config" && req.method === "POST") return await this.setAppConfig(req);
       if (path === "/api/reviewer" && req.method === "POST") return await this.setReviewer(req);
       if (path === "/api/verifier" && req.method === "POST") return await this.setVerifier(req);
+      if (path === "/api/memory") return this.memoryRoute();
+      if (path === "/api/memory/add" && req.method === "POST") return await this.memoryAdd(req);
+      if (path === "/api/memory/delete" && req.method === "POST") return await this.memoryDelete(req);
+      if (path === "/api/memory/clear" && req.method === "POST") return this.memoryClear();
       if (path === "/api/lock" && req.method === "POST") return this.lock();
       if (path === "/api/snapshots") return this.snapshotsRoute();
       if (path === "/api/undo" && req.method === "POST") return this.undoRoute();
@@ -196,6 +202,10 @@ export class GuiServer {
       verifier: {
         enabled: Boolean(u?.config.verifier?.enabled),
         command: u?.config.verifier?.command ?? "",
+      },
+      memory: {
+        enabled: u ? u.config.memory?.enabled !== false : true,
+        count: u ? u.memory.list().length : 0,
       },
       fileCount: u ? u.fs.paths().length : 0,
       // Project tabs: the list, which is active, and which are unlocked.
@@ -382,7 +392,7 @@ export class GuiServer {
     const u = this.active();
     if (!u) return json({ error: "locked" }, 401);
     if (this.opts.demo) return this.state();
-    const { mode, permissionMode } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string };
+    const { mode, permissionMode, memory } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean };
     if (mode !== undefined) {
       if (mode !== "build" && mode !== "plan") return json({ error: "mode must be build or plan" }, 400);
       u.config.agentMode = mode;
@@ -393,6 +403,7 @@ export class GuiServer {
       if (permissionMode !== "ask" && permissionMode !== "auto") return json({ error: "permissionMode must be ask or auto" }, 400);
       u.config.permissionMode = permissionMode;
     }
+    if (memory !== undefined) u.config.memory = { enabled: Boolean(memory) };
     saveConfig(u.store, u.config);
     return this.state();
   }
@@ -415,6 +426,39 @@ export class GuiServer {
     };
     saveConfig(u.store, u.config);
     return this.state();
+  }
+
+  /** The project's stored lessons, newest first. */
+  private memoryRoute(): Response {
+    const u = this.active();
+    if (!u) return json({ memory: [] });
+    const memory = u.memory.list().slice().reverse().map((m) => ({ id: m.id, text: m.text, kind: m.kind, source: m.source, createdAt: m.createdAt }));
+    return json({ memory });
+  }
+
+  private async memoryAdd(req: Request): Promise<Response> {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    if (this.opts.demo) return json({ error: "memory is disabled in demo mode" }, 400);
+    const { text } = (await req.json().catch(() => ({}))) as { text?: string };
+    if (!text || !text.trim()) return json({ error: "a lesson is required" }, 400);
+    u.memory.add(text, "fact", "user");
+    return this.memoryRoute();
+  }
+
+  private async memoryDelete(req: Request): Promise<Response> {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    const { id } = (await req.json().catch(() => ({}))) as { id?: string };
+    if (id) u.memory.remove(id);
+    return this.memoryRoute();
+  }
+
+  private memoryClear(): Response {
+    const u = this.active();
+    if (!u) return json({ error: "locked" }, 401);
+    u.memory.clear();
+    return this.memoryRoute();
   }
 
   private async setVerifier(req: Request): Promise<Response> {
@@ -611,6 +655,12 @@ export class GuiServer {
         if (v.verdict === "blocked") { this.push({ type: "note", text: `Reviewer paused the loop (needs you): ${v.reason}` }, pid); break; }
         // continue — guard against spinning on the same unresolved reason.
         if (v.reason && v.reason === lastReason) { this.push({ type: "note", text: "No progress since the last round — stopping the loop." }, pid); break; }
+        // Reflexion: distill the correction into a durable lesson (unless the
+        // user turned project memory off), so the mistake isn't repeated later.
+        if (u.config.memory?.enabled !== false) {
+          const lesson = u.memory.add(`${v.reason} → ${v.instruction}`, "lesson", "reviewer");
+          if (lesson) this.push({ type: "note", text: "Learned a lesson from the review (saved to project memory)." }, pid);
+        }
         lastReason = v.reason;
         userText = v.instruction;
       }
@@ -634,10 +684,12 @@ export class GuiServer {
       const r = compressed.report;
       this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` }, pid);
     }
+    // Inject the lessons most relevant to this turn (encrypted project memory).
+    const memories = u.memory.relevant(text).map((m) => m.text);
     const result = await runAgent({
       provider: u.provider,
       model: u.model,
-      system: buildAgentPrompt({ fs: u.fs, registry: u.registry, mode: u.mode }),
+      system: buildAgentPrompt({ fs: u.fs, registry: u.registry, mode: u.mode, memories }),
       messages: toProviderMessages(compressed.messages),
       registry: u.registry,
       ctx: u.ctx,
@@ -748,7 +800,8 @@ export class GuiServer {
     const sessions = new SessionStore(store);
     const session = sessions.createSession({ provider: providerName, model, title: `gui ${new Date().toISOString()}` });
     const snapshots = new SnapshotStore(store);
-    return { id, name, store, fs, runspace, provider, providerName, model, mode, registry, ctx, diagnostics, draft: new HeuristicDraftModel(), sessions, session, snapshots, config };
+    const memory = new MemoryStore(store);
+    return { id, name, store, fs, runspace, provider, providerName, model, mode, registry, ctx, diagnostics, draft: new HeuristicDraftModel(), sessions, session, snapshots, memory, config };
   }
 }
 

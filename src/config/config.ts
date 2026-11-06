@@ -58,6 +58,10 @@ export type AppConfig = {
     /** e.g. "bun test", "bun x tsc --noEmit", "cargo check". */
     command?: string;
   };
+  /** Encrypted project memory (Reflexion-style): when enabled (the default),
+   * reviewer corrections are distilled into durable lessons and injected into
+   * later turns so the agent stops repeating mistakes. */
+  memory?: { enabled?: boolean };
 };
 
 const COLLECTION = "_config";
