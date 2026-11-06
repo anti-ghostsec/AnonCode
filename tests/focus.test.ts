@@ -73,6 +73,30 @@ test("low-utility spans are dropped; goal, error, recent, and cited spans surviv
   expect(keptMsgs.has(filler.id)).toBe(false); // dropped
 });
 
+test("a mid-history user instruction is never dropped (regression: the forgotten 2nd message)", async () => {
+  // Reproduces the live bug: the user's 2nd message sat mid-history, wasn't in
+  // the recent window, and the draft cited nothing — FOCUS was evicting it, so
+  // the agent acted against instructions it could no longer see.
+  const goal = msg("user", "you there?");
+  const a1 = msg("assistant", "yes — let me get started on something generic");
+  const instruction = msg("user", "scan the literature on training-free KV-cache compression and summarize the top 3");
+  const a2 = msg("assistant", "lots of unrelated tool chatter and output here");
+  const filler = msg("assistant", "yet more unrelated commentary to pad the history out");
+  const recent = msg("user", "continue, were you cut off?");
+  const spans = buildSpans([goal, a1, instruction, a2, filler, recent]);
+
+  // Draft cites nothing; keepRecent=1 so only `recent` is recency-protected.
+  const { kept } = await focusCompress(spans, new FixedDraft([]), "continue", {
+    memoryBudgetTokens: 1, tau: 0.9, rollouts: 1, keepRecent: 1,
+  });
+  const keptMsgs = new Set(kept.flatMap((s) => s.messageIds));
+  expect(keptMsgs.has(goal.id)).toBe(true); // first user message (task goal)
+  expect(keptMsgs.has(instruction.id)).toBe(true); // the 2nd user message MUST survive
+  expect(keptMsgs.has(recent.id)).toBe(true); // recent
+  // non-user, uncited, non-recent spans may still be dropped
+  expect(keptMsgs.has(filler.id)).toBe(false);
+});
+
 test("an uncited error span is still rescued by the defensive pass", async () => {
   const goal = msg("user", "build it");
   const a = msg("assistant", "working on it");

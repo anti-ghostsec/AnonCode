@@ -17,6 +17,9 @@ import type { AgentFS } from "./types.ts";
 
 export type SnapshotMeta = {
   id: string;
+  /** Monotonic order index — robust chronological order even when several
+   * snapshots are created within the same millisecond (ids would tie). */
+  seq: number;
   label: string;
   createdAt: string;
   /** Fingerprint of the FS state, used to skip no-op snapshots. */
@@ -44,12 +47,13 @@ export class SnapshotStore {
     return h.digest("hex").slice(0, 16);
   }
 
-  /** Snapshot metas, oldest first (ids sort chronologically). */
+  /** Snapshot metas, oldest first (by monotonic seq, not id/time). */
   list(): SnapshotMeta[] {
     return this.store
       .list(META)
       .map((id) => this.store.getJSON<SnapshotMeta>(META, id))
-      .filter((s): s is SnapshotMeta => s !== null);
+      .filter((s): s is SnapshotMeta => s !== null)
+      .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
   }
 
   /**
@@ -72,6 +76,7 @@ export class SnapshotStore {
     }
     const meta: SnapshotMeta = {
       id: newId("snap"),
+      seq: (latest?.seq ?? 0) + 1,
       label: (label || "snapshot").trim().slice(0, 80),
       createdAt: new Date().toISOString(),
       fingerprint: fp,

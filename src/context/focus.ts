@@ -11,8 +11,9 @@ import type { DraftModel } from "./draft.ts";
  *      citation frequency u_hat(span) in [0,1] is the dependency score.
  *   3. Utility retention: keep spans with u_hat >= tau.
  *   4. Defensive pass: additionally keep spans whose loss would cause repeated
- *      mistakes or lost state — errors/failures, the task goal, system spans,
- *      and the most recent spans.
+ *      mistakes or lost state — errors/failures, EVERY user message (the task
+ *      goal and all later instructions — they can't be reconstructed), system
+ *      spans, and the most recent spans.
  *   5. Keep S_U ∪ S_defensive verbatim; drop the rest. Summarize nothing.
  *   6. (AnonCode extra) Optional hard cap: if still over a ceiling, drop the
  *      lowest-utility NON-protected spans until it fits.
@@ -100,7 +101,11 @@ export async function focusCompress(
     const reasons: string[] = [];
     let protectedSpan = false;
     if (s.isError) { protectedSpan = true; reasons.push("defensive: error/failure"); }
+    // Every user message is a non-reconstructable instruction, not just the
+    // first — losing any of them makes the agent act against a goal it can no
+    // longer see. They are cheap next to tool output, so always keep them.
     if (s.kind === "user_goal") { protectedSpan = true; reasons.push("defensive: task goal"); }
+    if (s.kind === "user") { protectedSpan = true; reasons.push("defensive: user instruction"); }
     if (s.kind === "system") { protectedSpan = true; reasons.push("defensive: system"); }
     if (i >= recentStart) { protectedSpan = true; reasons.push("defensive: recent state"); }
 
