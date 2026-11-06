@@ -69,6 +69,9 @@ export type AppConfig = {
    * reviewer corrections are distilled into durable lessons and injected into
    * later turns so the agent stops repeating mistakes. */
   memory?: { enabled?: boolean };
+  /** Best-of-N: generate N isolated candidates per turn and keep the judge's
+   * pick (1 = off, default; max 5). Pairs well with Auto permissions. */
+  bestOf?: number;
 };
 
 const COLLECTION = "_config";

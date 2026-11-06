@@ -38,6 +38,7 @@ import { buildAgentPrompt } from "../agent/prompt.ts";
 import { runAgent } from "../agent/agentloop.ts";
 import { runReview, summarizeTrace, type Verdict } from "../agent/reviewer.ts";
 import { runVerifier, verifierFeedback } from "../agent/verifier.ts";
+import { captureFs, restoreFs, pickBest } from "../agent/bestof.ts";
 import { stripToolBlock } from "../agent/toolcall.ts";
 import { AgentLoopError } from "../agent/loopguard.ts";
 import type { Provider } from "../providers/types.ts";
@@ -195,6 +196,7 @@ export class GuiServer {
       mode: u?.mode ?? "build",
       permissionMode: u?.config.permissionMode ?? "ask",
       focusDraft: u?.config.focusDraft ?? "heuristic",
+      bestOf: u?.config.bestOf ?? 1,
       reviewer: {
         enabled: Boolean(u?.config.reviewer?.enabled),
         prompt: u?.config.reviewer?.prompt ?? "",
@@ -406,7 +408,7 @@ export class GuiServer {
     const u = this.active();
     if (!u) return json({ error: "locked" }, 401);
     if (this.opts.demo) return this.state();
-    const { mode, permissionMode, memory, focusDraft } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean; focusDraft?: string };
+    const { mode, permissionMode, memory, focusDraft, bestOf } = (await req.json().catch(() => ({}))) as { mode?: string; permissionMode?: string; memory?: boolean; focusDraft?: string; bestOf?: number };
     if (mode !== undefined) {
       if (mode !== "build" && mode !== "plan") return json({ error: "mode must be build or plan" }, 400);
       u.config.agentMode = mode;
@@ -422,6 +424,7 @@ export class GuiServer {
       if (focusDraft !== "heuristic" && focusDraft !== "model") return json({ error: "focusDraft must be heuristic or model" }, 400);
       u.config.focusDraft = focusDraft;
     }
+    if (bestOf !== undefined) u.config.bestOf = Math.min(Math.max(Math.round(Number(bestOf) || 1), 1), 5);
     saveConfig(u.store, u.config);
     return this.state();
   }
@@ -630,8 +633,9 @@ export class GuiServer {
       let userText = text;
       let lastReason = "";
 
+      const bestOf = Math.min(Math.max(u.config.bestOf ?? 1, 1), 5);
       for (let round = 1; round <= maxRounds; round++) {
-        const result = await this.runWorkerTurn(u, userText);
+        const result = await this.runBestOfWorker(u, userText, bestOf, pid);
         this.pushFinal(result, pid);
 
         // Deterministic verifier gate: run the check command; on failure, loop
@@ -694,37 +698,46 @@ export class GuiServer {
     }
   }
 
-  /** One worker turn: add the user message, compress, run the agent, persist. */
-  private async runWorkerTurn(u: Unlocked, text: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
-    u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
+  /** Generate one worker result WITHOUT persisting it. Streams live events only
+   * when `stream` (best-of-N candidates run silently). */
+  private async generateCandidate(u: Unlocked, text: string, stream: boolean): Promise<Awaited<ReturnType<typeof runAgent>>> {
     const pid = u.id;
     // FOCUS draft model: the offline heuristic (rule-based defensive floor) by
     // default, or the model-backed draft (the paper's Monte-Carlo citation +
     // defensive review) when the user opts in — so both can be compared.
     const draft = u.config.focusDraft === "model" ? new ModelDraftModel(u.provider, u.model) : u.draft;
     const compressed = await compressHistory(u.sessions.messages(u.session), draft, text, u.config.focus);
-    if (compressed.report.triggered) {
+    if (stream && compressed.report.triggered) {
       const r = compressed.report;
       this.push({ type: "note", text: `FOCUS kept ${r.keptCount}/${r.decisions.length} spans (${r.keptTokens}/${r.totalTokens} tok)` }, pid);
     }
     // Inject the lessons most relevant to this turn (encrypted project memory).
     const memories = u.memory.relevant(text).map((m) => m.text);
-    const result = await runAgent({
+    const messages = toProviderMessages(compressed.messages);
+    messages.push({ role: "user", content: [{ type: "text", text }] });
+    return runAgent({
       provider: u.provider,
       model: u.model,
       system: buildAgentPrompt({ fs: u.fs, registry: u.registry, mode: u.mode, memories }),
-      messages: toProviderMessages(compressed.messages),
+      messages,
       registry: u.registry,
       ctx: u.ctx,
       diagnostics: u.diagnostics,
-      onEvent: (e) => {
-        if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text }, pid);
-        else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text }, pid);
-        else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args }, pid);
-        else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output }, pid);
-        else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text }, pid);
-      },
+      onEvent: stream
+        ? (e) => {
+            if (e.type === "reasoning") this.push({ type: "reasoning", text: e.text }, pid);
+            else if (e.type === "assistant_delta") this.push({ type: "assistant_delta", text: e.text }, pid);
+            else if (e.type === "tool_call") this.push({ type: "tool_call", tool: e.call.tool, args: e.call.args }, pid);
+            else if (e.type === "tool_result") this.push({ type: "tool_result", ok: e.ok, output: e.output }, pid);
+            else if (e.type === "diagnostics") this.push({ type: "diagnostics", text: e.text }, pid);
+          }
+        : undefined,
     });
+  }
+
+  /** Persist a worker turn: the user message, then the agent's step trace. */
+  private persistWorkerTurn(u: Unlocked, text: string, result: Awaited<ReturnType<typeof runAgent>>): void {
+    u.sessions.addMessage(u.session, "user", [{ type: "text", text }]);
     for (const entry of result.trace) {
       if (entry.kind === "assistant") {
         const prose = stripToolBlock(entry.text);
@@ -738,7 +751,45 @@ export class GuiServer {
         u.sessions.addMessage(u.session, "tool", [{ type: "tool_result", id: newId("tr"), result: t, isError: !entry.ok }]);
       }
     }
+  }
+
+  /** One worker turn: generate (streamed) and persist. */
+  private async runWorkerTurn(u: Unlocked, text: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
+    const result = await this.generateCandidate(u, text, true);
+    this.persistWorkerTurn(u, text, result);
     return result;
+  }
+
+  /** Best-of-N: run N candidates from the same starting state (rolling back the
+   * project between them), let a judge pick, and keep only the winner's files
+   * and messages. Falls back to a single streamed turn when n<=1. */
+  private async runBestOfWorker(u: Unlocked, text: string, n: number, pid: string): Promise<Awaited<ReturnType<typeof runAgent>>> {
+    if (n <= 1) return this.runWorkerTurn(u, text);
+    this.push({ type: "note", text: `Best-of-${n}: generating ${n} candidates…` }, pid);
+    const base = captureFs(u.fs);
+    const candidates: { result: Awaited<ReturnType<typeof runAgent>>; post: ReturnType<typeof captureFs> }[] = [];
+    for (let i = 0; i < n; i++) {
+      restoreFs(u.fs, base);
+      this.rematerializeRunspace(u);
+      const result = await this.generateCandidate(u, text, false);
+      candidates.push({ result, post: captureFs(u.fs) });
+    }
+    const judgeModel = (u.config.reviewer?.model && u.config.reviewer.model.trim()) || u.model;
+    const choice = await pickBest(u.provider, judgeModel, text,
+      candidates.map((c) => ({ text: c.result.finalText, evidence: summarizeTrace(c.result.trace) })));
+    const winner = candidates[choice.index] ?? candidates[0]!;
+    restoreFs(u.fs, winner.post);
+    this.rematerializeRunspace(u);
+    this.push({ type: "note", text: `Best-of-${n}: picked candidate ${choice.index + 1}.` }, pid);
+    this.persistWorkerTurn(u, text, winner.result);
+    return winner.result;
+  }
+
+  /** Rebuild the plaintext runspace from the (possibly rolled-back) vault FS. */
+  private rematerializeRunspace(u: Unlocked): void {
+    u.runspace.wipe();
+    u.runspace = Runspace.materialize(u.fs, u.runspace.dir);
+    u.ctx.runspace = u.runspace;
   }
 
   /** Render the worker's final answer (or the reasoning-only / empty cases). */

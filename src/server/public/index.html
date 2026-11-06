@@ -765,6 +765,10 @@ function renderSettings(s) {
     '<div class="set-sec"><h4>Context compression (FOCUS)</h4><div class="desc">How history is compressed once it gets long. <b>Offline</b> uses a fast local heuristic with a rule-based safety net. <b>Model review</b> runs the paper’s method — the model scores which spans to keep and reviews the rest for anything risky to drop — higher fidelity, but it spends extra model calls when compression triggers.</div>' +
       '<div class="seg" id="setFocus"><button data-f="heuristic"' + ((!s.focusDraft || s.focusDraft === "heuristic") ? ' class="on"' : '') + '>Offline</button>' +
       '<button data-f="model"' + (s.focusDraft === "model" ? ' class="on"' : '') + '>Model review</button></div></div>' +
+    '<div class="set-sec"><h4>Best-of-N</h4><div class="desc">Generate several candidate attempts per turn (each isolated and rolled back) and keep the one a judge picks. Higher N = better results, N× the cost. Pairs best with <b>Auto</b> permissions. 1 = off.</div>' +
+      '<div class="seg" id="setBestOf">' +
+      [1, 2, 3, 5].map((v) => '<button data-n="' + v + '"' + ((s.bestOf || 1) === v ? ' class="on"' : '') + '>' + v + '</button>').join("") +
+      '</div></div>' +
     '<div class="set-sec"><h4>Export project</h4><div class="desc">Decrypt the ' + (s.fileCount || 0) + ' project file(s) to a real folder (plaintext) — for building or pushing to GitHub. This is the only thing that writes unencrypted data.</div>' +
       '<div class="set-row"><input class="mini-input" id="setExportDir" placeholder="./out (folder path)" /><button class="sm" id="setExport">Export</button></div>' +
       '<div class="ok-line" id="setExportMsg"></div></div>' +
@@ -861,6 +865,14 @@ function renderSettings(s) {
     const focusDraft = btn.getAttribute("data-f");
     if (focusDraft === (s.focusDraft || "heuristic")) return;
     const res = await api("/api/config", { method: "POST", body: JSON.stringify({ focusDraft }) });
+    const ns = await res.json().catch(() => ({}));
+    if (res.ok && !ns.error) renderSettings(ns);
+  }));
+
+  $("setBestOf").querySelectorAll("button").forEach((btn) => btn.addEventListener("click", async () => {
+    const bestOf = Number(btn.getAttribute("data-n"));
+    if (bestOf === (s.bestOf || 1)) return;
+    const res = await api("/api/config", { method: "POST", body: JSON.stringify({ bestOf }) });
     const ns = await res.json().catch(() => ({}));
     if (res.ok && !ns.error) renderSettings(ns);
   }));
