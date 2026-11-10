@@ -274,3 +274,31 @@ fn focus_heuristic_prefers_spans_about_the_task() {
     assert!(r.kept.iter().any(|k| k == "hit"));
     assert!(r.dropped_count > 0);
 }
+
+#[test]
+fn one_login_holds_the_shared_settings() {
+    use anoncode::supervisor::{Config, Manager, Provider, Settings};
+    let dir = tmp("login");
+    let cfg = || Config { root: dir.clone(), base: dir.join(".anoncode"), server_command: Vec::new() };
+
+    let mut m = Manager::new(cfg()).unwrap();
+    assert!(!m.has_login());
+    assert!(m.settings().is_err(), "nothing is readable before a login");
+    m.setup("one passphrase").unwrap();
+    assert!(m.setup("another").is_err(), "the passphrase is set only once");
+    let settings = Settings { providers: vec![Provider { id: "venice".into(), key: "sk-test-123".into() }], model: Some(("venice".into(), "m".into())), known: vec![] };
+    m.save_settings(&settings).unwrap();
+    m.logout();
+    assert!(m.settings().is_err());
+
+    // The key is not readable on disk.
+    let sealed = fs::read(dir.join(".anoncode/app/settings/settings.enc")).unwrap();
+    assert!(!sealed.windows(11).any(|w| w == b"sk-test-123"));
+
+    let mut m = Manager::new(cfg()).unwrap();
+    assert!(m.has_login());
+    assert!(matches!(m.login("wrong"), Err(Error::WrongPassphrase)));
+    assert!(!m.logged_in());
+    m.login("one passphrase").unwrap();
+    assert_eq!(m.settings().unwrap(), settings);
+}

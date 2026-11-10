@@ -6,6 +6,14 @@
 //! (data, config, state, cache, temp) pointed inside `run/`. Locking stops
 //! the server, seals what changed and wipes `run/`. The key lives only in
 //! this process.
+//!
+//! There is one login. The app's own vault (`.anoncode/vault.json`,
+//! `.anoncode/app/`) is opened with the user's passphrase and holds, sealed,
+//! the settings shared by every project (provider keys, the default model)
+//! and each project's own secret. A project's vault is locked to a random
+//! secret made when the project is created, so opening a project asks for
+//! nothing. A project made before there was a login still has its own
+//! passphrase: it is asked for once and then kept in the app's vault.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -47,12 +55,33 @@ struct Open {
     child: Child,
 }
 
+/// Settings shared by every project, sealed in the app's vault.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Model providers and their API keys.
+    pub providers: Vec<Provider>,
+    /// `(provider, model)` used where a project has not chosen one.
+    pub model: Option<(String, String)>,
+    /// Providers the agent knows, `(id, name)`, remembered from the last
+    /// time an agent was running so they can be listed before one is.
+    pub known: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Provider {
+    pub id: String,
+    pub key: String,
+}
+
 /// What the interface shows for one project.
 #[derive(Clone, Debug)]
 pub struct ProjectView {
     pub id: String,
     pub name: String,
     pub open: bool,
+    /// Its secret is in the app's vault, so it opens without asking.
+    pub known: bool,
     /// How to reach this project's agent server, while it is unlocked.
     pub server: Option<Server>,
 }
@@ -81,6 +110,8 @@ pub struct Manager {
     cfg: Config,
     projects: Projects,
     open: BTreeMap<String, Open>,
+    /// The app's vault, while logged in.
+    app: Option<Store>,
 }
 
 fn other(msg: impl Into<String>) -> Error {
@@ -90,7 +121,56 @@ fn other(msg: impl Into<String>) -> Error {
 impl Manager {
     pub fn new(cfg: Config) -> Result<Manager> {
         create_private_dir(&cfg.base)?;
-        Ok(Manager { projects: Projects::new(&cfg.base), cfg, open: BTreeMap::new() })
+        Ok(Manager { projects: Projects::new(&cfg.base), cfg, open: BTreeMap::new(), app: None })
+    }
+
+    fn app_header(&self) -> PathBuf {
+        self.cfg.base.join("vault.json")
+    }
+
+    /// A passphrase has been set for the app.
+    pub fn has_login(&self) -> bool {
+        self.app_header().is_file()
+    }
+
+    pub fn logged_in(&self) -> bool {
+        self.app.is_some()
+    }
+
+    /// Sets the app's passphrase, the first time.
+    pub fn setup(&mut self, passphrase: &str) -> Result<()> {
+        if self.has_login() {
+            return Err(other("a passphrase is already set"));
+        }
+        let vault = Vault::create(passphrase)?;
+        crate::fsx::write_private_atomic(&self.app_header(), &serde_json::to_vec(&vault.header)?, true)?;
+        self.app = Some(Store::new(Arc::new(vault), self.cfg.base.join("app"))?);
+        Ok(())
+    }
+
+    pub fn login(&mut self, passphrase: &str) -> Result<()> {
+        let header = serde_json::from_slice(&fs::read(self.app_header())?)?;
+        let vault = Vault::unlock(passphrase, &header)?;
+        self.app = Some(Store::new(Arc::new(vault), self.cfg.base.join("app"))?);
+        Ok(())
+    }
+
+    /// Locks every project and forgets the app's key.
+    pub fn logout(&mut self) {
+        self.lock_all();
+        self.app = None;
+    }
+
+    fn app(&self) -> Result<&Store> {
+        self.app.as_ref().ok_or_else(|| other("not logged in"))
+    }
+
+    pub fn settings(&self) -> Result<Settings> {
+        Ok(self.app()?.get_json("settings", "settings")?.unwrap_or_default())
+    }
+
+    pub fn save_settings(&self, settings: &Settings) -> Result<()> {
+        self.app()?.put_json("settings", "settings", settings)
     }
 
     pub fn is_open(&self, id: &str) -> bool {
@@ -101,11 +181,25 @@ impl Manager {
         !self.open.is_empty()
     }
 
-    /// Creates a project locked to `passphrase` and opens it.
-    pub fn create(&mut self, name: &str, passphrase: &str) -> Result<String> {
-        let (meta, vault) = self.projects.create(name, passphrase)?;
+    /// Creates a project, locked to a random secret kept in the app's
+    /// vault, and opens it.
+    pub fn create(&mut self, name: &str) -> Result<String> {
+        let secret = random_hex(32)?;
+        let (meta, vault) = self.projects.create(name, &secret)?;
+        self.app()?.put_with("keys", &meta.id, secret.as_bytes(), true)?;
         self.start(&meta.id, Arc::new(vault))?;
         Ok(meta.id)
+    }
+
+    /// Opens a project whose secret is in the app's vault.
+    pub fn open(&mut self, id: &str) -> Result<()> {
+        if self.open.contains_key(id) {
+            return Ok(());
+        }
+        let secret = self.app()?.get("keys", id)?.ok_or_else(|| other("this project needs its own passphrase once"))?;
+        let secret = std::str::from_utf8(&secret).map_err(|_| Error::Damaged)?.to_string();
+        let vault = Arc::new(self.projects.unlock(id, &secret)?);
+        self.start(id, vault)
     }
 
     pub fn rename(&mut self, id: &str, name: &str) -> Result<()> {
@@ -116,11 +210,15 @@ impl Manager {
         Store::new(vault.clone(), &paths.dir)
     }
 
+    /// Opens a project made before there was a login, with its own
+    /// passphrase, and keeps that passphrase in the app's vault.
     pub fn unlock(&mut self, id: &str, passphrase: &str) -> Result<()> {
         if self.open.contains_key(id) {
             return Ok(());
         }
         let vault = Arc::new(self.projects.unlock(id, passphrase)?);
+        // Kept, sealed, so it is not asked for again.
+        self.app()?.put_with("keys", id, passphrase.as_bytes(), true)?;
         self.start(id, vault)
     }
 
@@ -271,6 +369,9 @@ impl Manager {
             stop(&mut open.child);
         }
         runspace::wipe(&self.projects.paths(id)?.scratch)?;
+        if let Some(app) = &self.app {
+            app.remove("keys", id)?;
+        }
         self.projects.delete(id)
     }
 
@@ -306,6 +407,7 @@ impl Manager {
             let paths = self.projects.paths(&p.id)?;
             out.push(ProjectView {
                 open: open.is_some(),
+                known: self.app.as_ref().is_some_and(|a| a.has("keys", &p.id)),
                 server: open.map(|o| Server { port: o.port, auth: format!("Basic {}", B64.encode(format!("opencode:{}", o.password))), work: paths.work.clone(), home: paths.home.clone() }),
                 id: p.id,
                 name: p.name,

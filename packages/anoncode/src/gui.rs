@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroize;
 
 use crate::api::Client;
-use crate::supervisor::{Config, Manager, ProjectView};
+use crate::supervisor::{Config, Manager, ProjectView, Provider, Settings};
 use crate::Result;
 
 /// Set by Ctrl+C and friends: close the window, which locks everything.
@@ -35,6 +35,11 @@ enum Msg {
     /// A project operation finished: what to say, or what went wrong.
     Done { id: String, result: std::result::Result<String, String> },
     Created(std::result::Result<String, String>),
+    /// The login finished: the shared settings, or what went wrong.
+    LoggedIn(std::result::Result<Settings, String>),
+    LoggedOut,
+    /// The shared provider keys were applied to a project's agent.
+    Applied { id: String, applied: BTreeMap<String, String> },
     Unlocked { id: String, error: Option<String> },
     Sessions { id: String, list: Vec<Value> },
     Messages { id: String, session: String, list: Vec<Value> },
@@ -74,6 +79,10 @@ struct Tab {
     to_bottom: bool,
     /// Pressed by the self-test script, as if Send had been clicked.
     press_send: bool,
+    /// Provider -> fingerprint of the key this project's agent was given.
+    applied: BTreeMap<String, String>,
+    /// The shared keys have been compared with this project's agent.
+    reconciled: bool,
     /// Remembered between unlocks, inside the project's sealed data.
     prefs: PathBuf,
 }
@@ -83,7 +92,6 @@ enum Dialog {
     Delete { id: String, name: String, typed: String },
     Export { id: String, dir: String },
     Import { id: String, dir: String },
-    Providers { id: String, filter: String, chosen: String, key: String },
     Loop { id: String, review: String },
     /// Choosing files to attach: the folder shown and what is in it.
     Attach { id: String, dir: PathBuf, typed: String, entries: Vec<(String, bool)> },
@@ -116,8 +124,20 @@ struct App {
     busy: BTreeSet<String>,
     creating: bool,
     new_name: String,
-    new_pass: String,
-    new_pass2: String,
+    /// A passphrase has been set for the app; and it has been given.
+    has_login: bool,
+    logged_in: bool,
+    login_pass: String,
+    login_pass2: String,
+    login_error: String,
+    login_busy: bool,
+    press_login: bool,
+    /// Shared by every project; sealed in the app's vault.
+    settings: Settings,
+    show_settings: bool,
+    set_filter: String,
+    set_chosen: String,
+    set_key: String,
     new_error: String,
     new_busy: bool,
     pass: String,
@@ -253,6 +273,8 @@ impl Tab {
             notice: String::new(),
             to_bottom: true,
             press_send: false,
+            applied: saved["applied"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default(),
+            reconciled: false,
             prefs,
         })
     }
@@ -263,7 +285,7 @@ impl Tab {
 
     fn save_prefs(&self) {
         let (provider, model) = self.model.clone().unwrap_or_default();
-        let _ = std::fs::write(&self.prefs, json!({ "provider": provider, "model": model, "session": self.session() }).to_string());
+        let _ = std::fs::write(&self.prefs, json!({ "provider": provider, "model": model, "session": self.session(), "applied": self.applied }).to_string());
     }
 
     fn select(&mut self, session: &str) {
@@ -294,21 +316,30 @@ fn request(tx: &Sender<Msg>, ctx: &egui::Context, id: &str, work: impl FnOnce() 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, manager: Manager) -> App {
         let (tx, rx) = channel();
-        let projects = manager.list().unwrap_or_default();
-        let selected = projects.first().map(|p| p.id.clone()).unwrap_or_default();
+        let has_login = manager.has_login();
         App {
             manager: Arc::new(Mutex::new(manager)),
             tx,
             rx,
             ctx: cc.egui_ctx.clone(),
-            creating: projects.is_empty(),
-            projects,
-            selected,
+            creating: false,
+            projects: Vec::new(),
+            selected: String::new(),
+            has_login,
+            logged_in: false,
+            login_pass: String::new(),
+            login_pass2: String::new(),
+            login_error: String::new(),
+            login_busy: false,
+            press_login: false,
+            settings: Settings::default(),
+            show_settings: false,
+            set_filter: String::new(),
+            set_chosen: String::new(),
+            set_key: String::new(),
             tabs: BTreeMap::new(),
             busy: BTreeSet::new(),
             new_name: String::new(),
-            new_pass: String::new(),
-            new_pass2: String::new(),
             new_error: String::new(),
             new_busy: false,
             pass: String::new(),
@@ -336,6 +367,96 @@ impl App {
         });
     }
 
+    /// Seals the shared settings, off the interface thread.
+    fn save_settings(&self) {
+        let (manager, settings) = (self.manager.clone(), self.settings.clone());
+        std::thread::spawn(move || {
+            let _ = manager.lock().unwrap().save_settings(&settings);
+        });
+    }
+
+    /// Keeps the agent's list of providers, so Settings can show it before
+    /// any project is open.
+    fn remember_providers(&mut self, id: &str) {
+        let Some(tab) = self.tabs.get(id) else { return };
+        let known: Vec<(String, String)> = tab
+            .integrations
+            .iter()
+            .filter(|i| i["methods"].as_array().is_some_and(|m| m.iter().any(|x| x["type"] == "key")))
+            .map(|i| (text(i, "id"), text(i, "name")))
+            .collect();
+        if !known.is_empty() && known != self.settings.known {
+            self.settings.known = known;
+            self.save_settings();
+        }
+    }
+
+    /// Makes a project's agent hold exactly the provider keys in Settings:
+    /// gives it the ones it lacks or that changed, takes back the rest.
+    fn reconcile(&mut self, id: &str) {
+        let Some(tab) = self.tabs.get_mut(id) else { return };
+        tab.reconciled = true;
+        let wanted: Vec<(String, String, String)> = self.settings.providers.iter().map(|p| (p.id.clone(), p.key.clone(), crate::efs::sha256_hex(p.key.as_bytes())[..16].to_string())).collect();
+        let connected: Vec<(String, Vec<String>)> = tab
+            .integrations
+            .iter()
+            .map(|i| (text(i, "id"), i["connections"].as_array().into_iter().flatten().filter(|c| c["type"] == "credential").map(|c| text(c, "id")).collect::<Vec<_>>()))
+            .filter(|(_, credentials)| !credentials.is_empty())
+            .collect();
+        let (client, shared, mut applied, tx, project) = (tab.client.clone(), tab.shared.clone(), tab.applied.clone(), self.tx.clone(), id.to_string());
+        request(&self.tx, &self.ctx, id, move || {
+            let mut problems = Vec::new();
+            for (provider, credentials) in &connected {
+                if !wanted.iter().any(|w| &w.0 == provider) {
+                    for c in credentials {
+                        let _ = client.disconnect(c);
+                    }
+                }
+            }
+            applied.retain(|provider, _| wanted.iter().any(|w| &w.0 == provider));
+            for (provider, key, fingerprint) in &wanted {
+                let held = connected.iter().find(|c| &c.0 == provider);
+                if held.is_some() && applied.get(provider) == Some(fingerprint) {
+                    continue;
+                }
+                for c in held.map(|h| h.1.as_slice()).unwrap_or_default() {
+                    let _ = client.disconnect(c);
+                }
+                match client.connect_key(provider, key) {
+                    Ok(()) => {
+                        applied.insert(provider.clone(), fingerprint.clone());
+                    }
+                    Err(e) => problems.push(format!("Could not connect {provider}: {e}")),
+                }
+            }
+            let _ = tx.send(Msg::Applied { id: project, applied });
+            shared.refresh.store(true, Ordering::SeqCst);
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                Err(problems.join("\n"))
+            }
+        });
+    }
+
+    /// After Settings changed: bring every open project's agent in line.
+    fn settings_changed(&mut self) {
+        self.save_settings();
+        for id in self.tabs.keys().cloned().collect::<Vec<_>>() {
+            if self.tabs[&id].integrations.is_empty() {
+                self.tabs.get_mut(&id).unwrap().reconciled = false;
+            } else {
+                self.reconcile(&id);
+            }
+        }
+    }
+
+    /// Opens a project whose secret the app's vault holds.
+    fn open_project(&mut self, id: &str) {
+        let target = id.to_string();
+        self.run(id, move |m| m.open(&target).map(|()| String::new()));
+    }
+
     fn take_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -343,7 +464,10 @@ impl App {
                     self.projects = list;
                     for p in &self.projects {
                         if p.open && !self.tabs.contains_key(&p.id) {
-                            if let Some(tab) = Tab::new(&p.id, p, &self.tx, &self.ctx) {
+                            if let Some(mut tab) = Tab::new(&p.id, p, &self.tx, &self.ctx) {
+                                if tab.model.is_none() {
+                                    tab.model = self.settings.model.clone();
+                                }
                                 self.tabs.insert(p.id.clone(), tab);
                             }
                         }
@@ -359,7 +483,7 @@ impl App {
                     if !self.projects.iter().any(|p| p.id == self.selected) {
                         self.selected = self.projects.first().map(|p| p.id.clone()).unwrap_or_default();
                     }
-                    if self.projects.is_empty() {
+                    if self.projects.is_empty() && self.logged_in {
                         self.creating = true;
                     }
                 }
@@ -377,6 +501,37 @@ impl App {
                             self.new_error.clear();
                         }
                         Err(e) => self.new_error = e,
+                    }
+                }
+                Msg::LoggedIn(result) => {
+                    self.login_busy = false;
+                    match result {
+                        Ok(settings) => {
+                            self.settings = settings;
+                            self.logged_in = true;
+                            self.has_login = true;
+                            self.login_error.clear();
+                            self.creating = self.projects.is_empty();
+                        }
+                        Err(e) => self.login_error = e,
+                    }
+                }
+                Msg::LoggedOut => {
+                    for tab in self.tabs.values() {
+                        tab.shared.stop.store(true, Ordering::SeqCst);
+                    }
+                    self.tabs.clear();
+                    self.projects.clear();
+                    self.settings = Settings::default();
+                    self.logged_in = false;
+                    self.show_settings = false;
+                    self.dialog = None;
+                    self.busy.clear();
+                }
+                Msg::Applied { id, applied } => {
+                    if let Some(tab) = self.tabs.get_mut(&id) {
+                        tab.applied = applied;
+                        tab.save_prefs();
                     }
                 }
                 Msg::Unlocked { id, error } => {
@@ -411,17 +566,29 @@ impl App {
                     }
                 }
                 Msg::Models { id, list } => {
+                    let default = self.settings.model.clone();
                     if let Some(tab) = self.tabs.get_mut(&id) {
                         tab.models = list.into_iter().filter(|m| m["type"].as_str().unwrap_or("chat") == "chat").collect();
                         let known = |m: &(String, String)| tab.models.iter().any(|x| x["providerID"] == m.0.as_str() && x["id"] == m.1.as_str());
-                        if tab.model.as_ref().is_some_and(|m| !known(m)) {
+                        // An empty list only means the agent has no provider key yet: keep the choice.
+                        if !tab.models.is_empty() && tab.model.as_ref().is_some_and(|m| !known(m)) {
                             tab.model = None;
+                        }
+                        if tab.model.is_none() && default.as_ref().is_some_and(known) {
+                            tab.model = default;
+                            tab.save_prefs();
                         }
                     }
                 }
                 Msg::Integrations { id, list } => {
+                    let mut ready = false;
                     if let Some(tab) = self.tabs.get_mut(&id) {
+                        ready = !list.is_empty() && !tab.reconciled;
                         tab.integrations = list;
+                    }
+                    if ready {
+                        self.remember_providers(&id);
+                        self.reconcile(&id);
                     }
                 }
                 Msg::Commands { id, names } => {
@@ -479,15 +646,21 @@ impl App {
                 });
             }
             if let Some(id) = select {
-                self.selected = id;
+                let closed = self.projects.iter().any(|p| p.id == id && p.known && !p.open) && !self.busy.contains(&id);
+                self.selected = id.clone();
                 self.creating = false;
                 self.pass.zeroize();
                 self.pass_error.clear();
+                if closed {
+                    self.open_project(&id);
+                }
             }
             if ui.selectable_label(self.creating, " + ").on_hover_text("New project").clicked() {
                 self.creating = true;
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                self.settings_button(ui);
+                ui.separator();
                 let id = self.selected.clone();
                 if !self.creating && self.tabs.contains_key(&id) {
                     let idle = !self.busy.contains(&id);
@@ -516,17 +689,25 @@ impl App {
         ui.separator();
     }
 
+    /// The far end of the tab bar: Settings, for the whole app.
+    fn settings_button(&mut self, ui: &mut Ui) {
+        if ui.selectable_label(self.show_settings, "Settings").on_hover_text("Provider keys and the lock, for every project").clicked() {
+            self.show_settings = !self.show_settings;
+        }
+    }
+
     fn create_form(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
             ui.set_max_width(380.0);
             ui.add_space(60.0);
             ui.heading("New project");
-            ui.label(RichText::new("Each project is its own vault with its own passphrase. There is no recovery: a lost passphrase means the project is gone.").weak());
+            ui.label(RichText::new("A project is its own encrypted vault. It opens with your AnonCode passphrase; there is nothing else to remember.").weak());
             ui.add_space(8.0);
-            ui.add(TextEdit::singleline(&mut self.new_name).hint_text("Name (shown on the tab, not encrypted)").desired_width(f32::INFINITY));
-            ui.add(TextEdit::singleline(&mut self.new_pass).password(true).hint_text("Passphrase").desired_width(f32::INFINITY));
-            let again = ui.add(TextEdit::singleline(&mut self.new_pass2).password(true).hint_text("Passphrase again").desired_width(f32::INFINITY));
-            let enter = again.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let field = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("Name (shown on the tab, not encrypted)").desired_width(f32::INFINITY));
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if !self.new_busy && self.new_name.is_empty() && !field.has_focus() {
+                field.request_focus();
+            }
             if !self.new_error.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.new_error);
             }
@@ -537,28 +718,169 @@ impl App {
                     self.creating = false;
                 }
                 if (go || enter || std::mem::take(&mut self.press_create)) && !self.new_busy {
-                    if self.new_pass.chars().count() < 8 {
-                        self.new_error = "Use a passphrase of at least 8 characters.".into();
-                    } else if self.new_pass != self.new_pass2 {
-                        self.new_error = "The two passphrases don't match.".into();
-                    } else {
-                        self.new_busy = true;
-                        self.new_error.clear();
-                        let (manager, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
-                        let (name, mut pass) = (self.new_name.clone(), std::mem::take(&mut self.new_pass));
-                        self.new_pass2.zeroize();
-                        std::thread::spawn(move || {
-                            let mut m = manager.lock().unwrap();
-                            let result = m.create(&name, &pass).map_err(|e| e.to_string());
-                            pass.zeroize();
-                            let _ = tx.send(Msg::Projects(m.list().unwrap_or_default()));
-                            let _ = tx.send(Msg::Created(result));
-                            ctx.request_repaint();
-                        });
-                    }
+                    self.new_busy = true;
+                    self.new_error.clear();
+                    let (manager, tx, ctx, name) = (self.manager.clone(), self.tx.clone(), self.ctx.clone(), self.new_name.clone());
+                    std::thread::spawn(move || {
+                        let mut m = manager.lock().unwrap();
+                        let result = m.create(&name).map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::Projects(m.list().unwrap_or_default()));
+                        let _ = tx.send(Msg::Created(result));
+                        ctx.request_repaint();
+                    });
                 }
             });
         });
+    }
+
+    /// The first screen: set the app's passphrase, or give it.
+    fn login_form(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(380.0);
+            ui.add_space(110.0);
+            ui.heading("AnonCode");
+            ui.label(RichText::new(if self.has_login {
+                "Everything is encrypted. Enter your passphrase to open it."
+            } else {
+                "Choose a passphrase. It unlocks every project, your provider keys and your settings. There is no recovery: if it is lost, everything is."
+            }).weak());
+            ui.add_space(8.0);
+            let first = ui.add_enabled(!self.login_busy, TextEdit::singleline(&mut self.login_pass).password(true).hint_text("Passphrase").desired_width(f32::INFINITY));
+            let mut enter = first.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && self.has_login;
+            if !self.has_login {
+                let again = ui.add_enabled(!self.login_busy, TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Passphrase again").desired_width(f32::INFINITY));
+                enter = again.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            } else if !self.login_busy && self.login_pass.is_empty() && !first.has_focus() {
+                first.request_focus();
+            }
+            if !self.login_error.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &self.login_error);
+            }
+            ui.add_space(6.0);
+            let label = match (self.login_busy, self.has_login) {
+                (true, _) => "Opening…",
+                (false, true) => "Unlock",
+                (false, false) => "Set passphrase",
+            };
+            let go = ui.add_enabled(!self.login_busy, egui::Button::new(label)).clicked();
+            if (go || enter || std::mem::take(&mut self.press_login)) && !self.login_busy && !self.login_pass.is_empty() {
+                if !self.has_login && self.login_pass.chars().count() < 8 {
+                    self.login_error = "Use a passphrase of at least 8 characters.".into();
+                } else if !self.has_login && self.login_pass != self.login_pass2 {
+                    self.login_error = "The two passphrases don't match.".into();
+                } else {
+                    self.login_busy = true;
+                    self.login_error.clear();
+                    let (manager, tx, ctx, setup) = (self.manager.clone(), self.tx.clone(), self.ctx.clone(), !self.has_login);
+                    let mut pass = std::mem::take(&mut self.login_pass);
+                    self.login_pass2.zeroize();
+                    std::thread::spawn(move || {
+                        let mut m = manager.lock().unwrap();
+                        let result = if setup { m.setup(&pass) } else { m.login(&pass) };
+                        pass.zeroize();
+                        let result = result.and_then(|()| m.settings()).map_err(|e| match e {
+                            crate::Error::WrongPassphrase => "Wrong passphrase.".to_string(),
+                            other => other.to_string(),
+                        });
+                        if result.is_ok() {
+                            let _ = tx.send(Msg::Projects(m.list().unwrap_or_default()));
+                        }
+                        let _ = tx.send(Msg::LoggedIn(result));
+                        ctx.request_repaint();
+                    });
+                }
+            }
+        });
+    }
+
+    /// Settings for the whole app, apart from any project.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut logout = false;
+        egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0]).show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.strong("Model providers");
+            ui.label(RichText::new("Add a provider's API key once. It is sealed in AnonCode's vault and used by every project.").weak());
+            ui.add_space(4.0);
+            let mut remove = None;
+            for (i, p) in self.settings.providers.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    let name = self.settings.known.iter().find(|k| k.0 == p.id).map(|k| k.1.clone()).unwrap_or_else(|| p.id.clone());
+                    let tail: String = p.key.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                    ui.label(format!("{name}   key ending {tail}"));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if self.settings.providers.is_empty() {
+                ui.label(RichText::new("None yet. Without one there are no models to choose.").weak());
+            }
+            if let Some(i) = remove {
+                self.settings.providers.remove(i).key.zeroize();
+                changed = true;
+            }
+            ui.separator();
+            ui.label("Add a provider");
+            ui.add(TextEdit::singleline(&mut self.set_filter).hint_text("Search, or type a provider id (venice, openrouter, ollama…)").desired_width(f32::INFINITY));
+            let needle = self.set_filter.trim().to_lowercase();
+            // Until an agent has run once, only a short list is known.
+            let builtin = [("venice", "Venice AI"), ("openrouter", "OpenRouter"), ("openai", "OpenAI"), ("groq", "Groq"), ("deepseek", "DeepSeek"), ("mistral", "Mistral"), ("xai", "xAI")];
+            let known: Vec<(String, String)> = if self.settings.known.is_empty() { builtin.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() } else { self.settings.known.clone() };
+            ScrollArea::vertical().max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
+                for (id, name) in known.iter().filter(|(id, name)| needle.is_empty() || id.contains(&needle) || name.to_lowercase().contains(&needle)) {
+                    if ui.selectable_label(self.set_chosen == *id, name).clicked() {
+                        self.set_chosen = id.clone();
+                    }
+                }
+                if !needle.is_empty() && !known.iter().any(|(id, _)| *id == needle) && ui.selectable_label(self.set_chosen == needle, format!("Use the id \"{needle}\"")).clicked() {
+                    self.set_chosen = needle.clone();
+                }
+            });
+            if !self.set_chosen.is_empty() {
+                ui.add_space(4.0);
+                ui.label(format!("API key for {}:", self.set_chosen));
+                ui.add(TextEdit::singleline(&mut self.set_key).password(true).hint_text("Paste the key (Ctrl+V)").desired_width(f32::INFINITY));
+                if ui.add_enabled(!self.set_key.trim().is_empty(), egui::Button::new("Save key")).clicked() {
+                    let key = std::mem::take(&mut self.set_key).trim().to_string();
+                    let id = std::mem::take(&mut self.set_chosen);
+                    self.settings.providers.retain(|p| p.id != id);
+                    self.settings.providers.push(Provider { id, key });
+                    self.set_filter.clear();
+                    changed = true;
+                }
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Lock AnonCode").on_hover_text("Seal and close every project and ask for the passphrase again").clicked() {
+                    logout = true;
+                }
+                ui.label(RichText::new("Closing the window does the same.").weak());
+            });
+        });
+        if changed {
+            self.settings_changed();
+        }
+        if logout {
+            let (manager, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
+            for tab in self.tabs.values() {
+                tab.shared.stop.store(true, Ordering::SeqCst);
+            }
+            std::thread::spawn(move || {
+                manager.lock().unwrap().logout();
+                let _ = tx.send(Msg::LoggedOut);
+                ctx.request_repaint();
+            });
+        }
+        if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.show_settings = false;
+        }
     }
 
     fn locked_form(&mut self, ui: &mut Ui) {
@@ -568,7 +890,19 @@ impl App {
             ui.set_max_width(380.0);
             ui.add_space(80.0);
             ui.heading(&project.name);
-            ui.label(RichText::new("This project is locked. Everything in it is encrypted on disk.").weak());
+            if project.known {
+                ui.label(RichText::new("Closed. Everything in it is encrypted on disk.").weak());
+                ui.add_space(8.0);
+                let go = ui.add_enabled(!busy, egui::Button::new(if busy { "Opening…" } else { "Open" })).clicked();
+                if busy {
+                    ui.spinner();
+                }
+                if (go || ui.input(|i| i.key_pressed(Key::Enter))) && !busy {
+                    self.open_project(&project.id);
+                }
+                return;
+            }
+            ui.label(RichText::new("This project was made before AnonCode had a single login and still has its own passphrase. Enter it once; after that it opens with the others.").weak());
             ui.add_space(8.0);
             let field = ui.add_enabled(!busy, TextEdit::singleline(&mut self.pass).password(true).hint_text("Passphrase").desired_width(f32::INFINITY));
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -606,6 +940,7 @@ impl App {
         let id = self.selected.clone();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let mut open_dialog = None;
+        let mut picked: Option<(String, String)> = None;
         let Some(tab) = self.tabs.get_mut(&id) else { return };
         let height = ui.available_height();
         ui.horizontal_top(|ui| {
@@ -650,7 +985,7 @@ impl App {
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), Layout::top_down(Align::Min), |ui| {
                 // Model, providers, loop.
                 ui.horizontal(|ui| {
-                    let shown = tab.model.as_ref().map(|(p, m)| format!("{p} / {m}")).unwrap_or_else(|| if tab.models.is_empty() { "No model: connect a provider".into() } else { "Choose a model".into() });
+                    let shown = tab.model.as_ref().map(|(p, m)| format!("{p} / {m}")).unwrap_or_else(|| if tab.models.is_empty() { "No model: add a provider key in Settings".into() } else { "Choose a model".into() });
                     let before = tab.model.clone();
                     egui::ComboBox::from_id_salt("model").selected_text(clip(&shown, 46)).width(300.0).height(420.0).show_ui(ui, |ui| {
                         for m in &tab.models {
@@ -662,15 +997,13 @@ impl App {
                         }
                     });
                     if tab.model != before {
+                        picked = tab.model.clone();
                         tab.save_prefs();
                         let session = tab.session();
                         if let (false, Some((p, m))) = (session.is_empty(), tab.model.clone()) {
                             let client = tab.client.clone();
                             request(&tx, &ctx, &id, move || client.set_model(&session, &p, &m));
                         }
-                    }
-                    if ui.button("Providers…").on_hover_text("Connect a model provider with your own API key").clicked() {
-                        open_dialog = Some(Dialog::Providers { id: id.clone(), filter: String::new(), chosen: String::new(), key: String::new() });
                     }
                     if ui.button("Loop…").on_hover_text("A reviewer that checks each turn and tells the agent what to do next").clicked() {
                         open_dialog = Some(Dialog::Loop { id: id.clone(), review: String::new() });
@@ -785,7 +1118,7 @@ impl App {
                         tab.commands.iter().any(|c| c == name).then(|| (name.to_string(), args.trim().to_string()))
                     });
                     if tab.model.is_none() {
-                        tab.notice = "Choose a model first. If the list is empty, connect a provider with your API key (Providers…).".into();
+                        tab.notice = "Choose a model first. If the list is empty, add a provider's API key in Settings (top right).".into();
                         tab.composer = message;
                     } else {
                         tab.notice.clear();
@@ -813,6 +1146,10 @@ impl App {
         });
         if open_dialog.is_some() {
             self.dialog = open_dialog;
+        }
+        if picked.is_some() && picked != self.settings.model {
+            self.settings.model = picked;
+            self.save_settings();
         }
     }
 
@@ -868,56 +1205,6 @@ impl App {
                         let (target, from) = (id.clone(), dir.clone());
                         self.run(id, move |m| m.import(&target, &from).map(|n| format!("Imported {n} files.")));
                         keep = false;
-                    }
-                });
-            }
-            Dialog::Providers { id, filter, chosen, key } => {
-                let Some(tab) = self.tabs.get(id) else { return };
-                window("Model providers").open(&mut open).show(ctx, |ui| {
-                    ui.set_width(420.0);
-                    ui.label(RichText::new("Keys are stored in this project's sealed data. Each project has its own.").weak());
-                    let connected: Vec<&Value> = tab.integrations.iter().filter(|i| i["connections"].as_array().is_some_and(|c| !c.is_empty())).collect();
-                    for i in &connected {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Connected: {}", text(i, "name")));
-                            if ui.small_button("Disconnect").clicked() {
-                                let (client, shared, credential) = (tab.client.clone(), tab.shared.clone(), text(&i["connections"][0], "id"));
-                                request(&self.tx, &self.ctx, id, move || {
-                                    client.disconnect(&credential)?;
-                                    shared.refresh.store(true, Ordering::SeqCst);
-                                    Ok(())
-                                });
-                            }
-                        });
-                    }
-                    ui.separator();
-                    ui.add(TextEdit::singleline(filter).hint_text("Search providers (Venice, OpenRouter, Ollama…)").desired_width(f32::INFINITY));
-                    let needle = filter.to_lowercase();
-                    ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                        for i in tab.integrations.iter().filter(|i| i["methods"].as_array().is_some_and(|m| m.iter().any(|x| x["type"] == "key"))) {
-                            let name = text(i, "name");
-                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) && !text(i, "id").contains(&needle) {
-                                continue;
-                            }
-                            if ui.selectable_label(*chosen == text(i, "id"), name).clicked() {
-                                *chosen = text(i, "id");
-                            }
-                        }
-                    });
-                    if !chosen.is_empty() {
-                        ui.separator();
-                        ui.label(format!("API key for {chosen}:"));
-                        ui.add(TextEdit::singleline(key).password(true).desired_width(f32::INFINITY));
-                        if ui.add_enabled(!key.trim().is_empty(), egui::Button::new("Connect")).clicked() {
-                            let (client, shared, integration, mut secret) = (tab.client.clone(), tab.shared.clone(), chosen.clone(), std::mem::take(key));
-                            request(&self.tx, &self.ctx, id, move || {
-                                let result = client.connect_key(&integration, secret.trim());
-                                secret.zeroize();
-                                shared.refresh.store(true, Ordering::SeqCst);
-                                result
-                            });
-                            chosen.clear();
-                        }
                     }
                 });
             }
@@ -1245,6 +1532,10 @@ impl eframe::App for App {
         #[cfg(feature = "selftest")]
         selftest::step(self, ui.ctx());
         egui::CentralPanel::default().show(ui, |ui| {
+            if !self.logged_in {
+                self.login_form(ui);
+                return;
+            }
             self.tab_bar(ui);
             let selected_open = self.tabs.contains_key(&self.selected);
             if self.creating {
@@ -1257,13 +1548,14 @@ impl eframe::App for App {
         });
         let ctx = ui.ctx().clone();
         self.dialogs(&ctx);
+        self.settings_window(&ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         for tab in self.tabs.values() {
             tab.shared.stop.store(true, Ordering::SeqCst);
         }
-        self.manager.lock().unwrap().lock_all();
+        self.manager.lock().unwrap().logout();
     }
 }
 
@@ -1290,10 +1582,13 @@ pub fn run(cfg: Config) -> Result<()> {
 /// `ANONCODE_SELFTEST` holds one step per line:
 ///
 /// ```text
-/// create NAME PASSPHRASE     fill in and press Create
-/// unlock PASSPHRASE          fill in and press Unlock
-/// open                       wait until the selected project is unlocked
-/// connect PROVIDER ENVVAR    store the API key held in $ENVVAR
+/// login PASSPHRASE           set (first run) or give the app's passphrase
+/// create NAME                fill in and press Create
+/// select NAME                click the tab with this name
+/// unlock PASSPHRASE          an old project's own passphrase: fill in and press Unlock
+/// open                       wait until the selected project is open
+/// provider PROVIDER ENVVAR   in Settings, save the API key held in $ENVVAR
+/// noprovider PROVIDER        in Settings, remove that provider's key
 /// model PROVIDER MODEL       wait for the model to be listed, then choose it
 /// attach PATH                attach a file to the next message
 /// say TEXT                   type TEXT and press Send
@@ -1332,16 +1627,44 @@ mod selftest {
         }
         let id = app.selected.clone();
         let done = match word {
+            "login" => {
+                if first {
+                    app.login_pass = rest.to_string();
+                    app.login_pass2 = rest.to_string();
+                    app.press_login = true;
+                }
+                !first && app.logged_in
+            }
             "create" => {
                 if first {
-                    let (name, pass) = rest.split_once(' ').unwrap_or((rest, ""));
                     app.creating = true;
-                    app.new_name = name.to_string();
-                    app.new_pass = pass.to_string();
-                    app.new_pass2 = pass.to_string();
+                    app.new_name = rest.to_string();
                     app.press_create = true;
                 }
                 !first && !app.new_busy
+            }
+            "provider" => {
+                let (provider, var) = rest.split_once(' ').unwrap_or((rest, ""));
+                app.settings.providers.retain(|p| p.id != provider);
+                app.settings.providers.push(Provider { id: provider.to_string(), key: std::env::var(var).unwrap_or_default() });
+                app.settings_changed();
+                true
+            }
+            "noprovider" => {
+                app.settings.providers.retain(|p| p.id != rest);
+                app.settings_changed();
+                true
+            }
+            "select" => {
+                // Click the tab with this name.
+                if let Some(p) = app.projects.iter().find(|p| p.name == rest).cloned() {
+                    app.selected = p.id.clone();
+                    app.creating = false;
+                    if p.known && !p.open {
+                        app.open_project(&p.id);
+                    }
+                }
+                true
             }
             "unlock" => {
                 if first {
@@ -1351,29 +1674,15 @@ mod selftest {
                 !first
             }
             "open" => app.tabs.contains_key(&id) && !app.busy.contains(&id),
-            "connect" => {
-                let (provider, var) = rest.split_once(' ').unwrap_or((rest, ""));
-                let listed = app.tabs.get(&id).is_some_and(|t| t.integrations.iter().any(|i| i["id"] == provider));
-                if !listed {
-                    app.script.started = false;
-                    return;
-                }
-                if let (true, Some(tab)) = (first, app.tabs.get(&id)) {
-                    let (client, shared, provider, key) = (tab.client.clone(), tab.shared.clone(), provider.to_string(), std::env::var(var).unwrap_or_default());
-                    request(&app.tx, &app.ctx, &id, move || {
-                        client.connect_key(&provider, &key)?;
-                        shared.refresh.store(true, Ordering::SeqCst);
-                        Ok(())
-                    });
-                }
-                !first
-            }
             "model" => {
                 let (provider, model) = rest.split_once(' ').unwrap_or((rest, ""));
                 match app.tabs.get_mut(&id) {
                     Some(tab) if tab.models.iter().any(|m| m["providerID"] == provider && m["id"] == model) => {
                         tab.model = Some((provider.to_string(), model.to_string()));
                         tab.save_prefs();
+                        // As the dropdown does: the choice becomes the default for other projects.
+                        app.settings.model = Some((provider.to_string(), model.to_string()));
+                        app.save_settings();
                         true
                     }
                     Some(tab) => {
