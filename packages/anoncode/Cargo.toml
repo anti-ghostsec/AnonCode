@@ -1,0 +1,51 @@
+# AnonCode's encryption core and launcher. Stands alone: it inherits nothing
+# from the JavaScript workspace around it.
+[package]
+name = "anoncode"
+version = "0.1.0"
+edition = "2021"
+description = "Passphrase-sealed project vaults, the plaintext runspace, FOCUS context compression and the launcher for AnonCode"
+license = "MIT"
+publish = false
+
+[lib]
+name = "anoncode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anoncode"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+# The window. Without it only the core and the command line build.
+gui = ["dep:eframe", "dep:ureq"]
+# Developer builds only: lets a script press the buttons (see gui.rs).
+selftest = ["gui"]
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"], optional = true }
+ureq = { version = "2.12", default-features = false, optional = true }
+aes-gcm = "0.10"
+base64 = "0.22"
+getrandom = { version = "0.2", features = ["std"] }
+scrypt = { version = "0.11", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"
+
+# The KDF and the ciphers are unusably slow unoptimised.
+[profile.dev.package."*"]
+opt-level = 3
+[profile.dev]
+opt-level = 1

@@ -39,3 +39,7 @@ tsconfig.tsbuildinfo
 
 # Legal drafts pending review are kept outside the repository; never copy them in.
 legal-drafts-private/
+
+# AnonCode
+.anoncode/
+packages/anoncode/target/

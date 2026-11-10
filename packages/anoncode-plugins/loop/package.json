@@ -1,0 +1,9 @@
+{
+  "name": "anoncode-loop",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./server.ts"
+  }
+}

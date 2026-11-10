@@ -1,0 +1,1 @@
+{"version":1,"kdf":{"algo":"scrypt","N":16384,"r":8,"p":1,"keyLen":32},"salt":"Y06J2ZnffIMxuRKzSUkoTg==","check":{"iv":"nXhrf20NSuE9zbmG","tag":"k92jhNZLxbA0MgsTyiagyg==","ct":"y7PwWlSo7NnVs6CtJLW7eAbK2TbvSaE="}}

@@ -1,114 +1,94 @@
-<p align="center">
-  <a href="https://opencode.ai">
-    <picture>
-      <source srcset=".github/assets/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
-      <source srcset=".github/assets/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
-      <img src=".github/assets/logo-ornate-light.svg" alt="OpenCode logo">
-    </picture>
-  </a>
-</p>
-<p align="center">The open source AI coding agent.</p>
-<p align="center">
-  <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
-  <a href="https://www.npmjs.com/package/@opencode/cli"><img alt="npm" src="https://img.shields.io/npm/v/@opencode/cli?style=flat-square" /></a>
-  <a href="https://github.com/anomalyco/opencode/actions/workflows/release.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/release.yml?style=flat-square&branch=dev" /></a>
-</p>
+# AnonCode
 
-<p align="center">
-  <a href="README.md">English</a> |
-  <a href="README.zh.md">简体中文</a> |
-  <a href="README.zht.md">繁體中文</a> |
-  <a href="README.ko.md">한국어</a> |
-  <a href="README.de.md">Deutsch</a> |
-  <a href="README.es.md">Español</a> |
-  <a href="README.fr.md">Français</a> |
-  <a href="README.it.md">Italiano</a> |
-  <a href="README.da.md">Dansk</a> |
-  <a href="README.ja.md">日本語</a> |
-  <a href="README.pl.md">Polski</a> |
-  <a href="README.ru.md">Русский</a> |
-  <a href="README.bs.md">Bosanski</a> |
-  <a href="README.ar.md">العربية</a> |
-  <a href="README.no.md">Norsk</a> |
-  <a href="README.br.md">Português (Brasil)</a> |
-  <a href="README.th.md">ไทย</a> |
-  <a href="README.tr.md">Türkçe</a> |
-  <a href="README.uk.md">Українська</a> |
-  <a href="README.bn.md">বাংলা</a> |
-  <a href="README.gr.md">Ελληνικά</a> |
-  <a href="README.vi.md">Tiếng Việt</a>
-</p>
+A private AI coding agent with a native interface. Every project is its own encrypted vault:
+its files, its chats and its API keys are sealed under a passphrase and unreadable without it.
 
-[![OpenCode Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://opencode.ai)
+AnonCode is three things put together:
 
----
+- **The agent** is [opencode](https://github.com/anomalyco/opencode) (v2.2.7), unmodified. It
+  does the chat, the tools and the language servers. Its own readme is in
+  [README.opencode.md](README.opencode.md).
+- **The app** (`packages/anoncode`, Rust) is the window you use and the vault underneath it.
+  It is not a web page and has no browser in it.
+- **Two plugins** (`packages/anoncode-plugins`) add the reviewer loop and FOCUS context
+  compression to the agent.
 
-### Installation
+> Status: early. It runs and has been used against a real model, but parts of the interface
+> have only been exercised by a script. See "What's missing".
 
-```bash
-# YOLO
-curl -fsSL https://opencode.ai/v2/install | bash
+## Using it
 
-# Package managers
-npm i -g @opencode/cli@latest      # or bun/pnpm/yarn
-brew install anomalyco/tap/opencode-v2 # macOS and Linux (recommended, always up to date)
-brew install opencode              # macOS and Linux (official brew formula, updated less)
-sudo pacman -S opencode            # Arch Linux (Stable)
-paru -S opencode-beta              # Arch Linux (Latest from AUR)
-mise use -g opencode               # Any OS
-nix run github:anomalyco/opencode  # Nix
+```sh
+./anoncode
 ```
 
-> [!TIP]
-> Remove versions older than 0.1.x before installing.
+The first run builds the app and installs the agent's dependencies. You need
+[Rust](https://rustup.rs) and [Bun](https://bun.sh) 1.4.
 
-### Desktop App (BETA)
+- **Projects are tabs** across the top, like a browser. `+` makes a new one; a locked project
+  shows a lock. Double-click a tab to rename it, right-click to delete it.
+- **Unlocking** a project asks for its passphrase and starts an agent for it. **Lock** (or
+  closing the window) seals everything and stops the agent.
+- **Providers…** connects a model provider with your own API key. The key is stored in that
+  project's sealed data. No models are available until you connect one: opencode's hosted
+  models, web search and sharing are switched off, and the model list is not fetched from the
+  network.
+- **+** in the message box attaches files; you can also drop files on the window.
+- **Loop…** starts a reviewer that checks each turn against your request and tells the agent
+  what to do next. Its messages appear in the chat like any other
+  ([more](packages/anoncode-plugins/loop/README.md)).
+- **Import** copies a folder into a project. **Export** decrypts a project to a folder.
 
-OpenCode is also available as a desktop application. Download it from [opencode.ai/download](https://opencode.ai/download).
+## What is sealed, and how
 
-| Platform              | Download                           |
-| --------------------- | ---------------------------------- |
-| macOS (Apple Silicon) | `opencode-desktop-mac-arm64.dmg`   |
-| macOS (Intel)         | `opencode-desktop-mac-x64.dmg`     |
-| Windows               | `opencode-desktop-win-x64.exe`     |
-| Linux                 | `.deb`, `.rpm`, or `.AppImage`     |
+| | |
+| --- | --- |
+| Key | scrypt (64 MiB) over your passphrase and a random salt. The cost stored in a vault is checked against a minimum and a maximum before anything is derived. |
+| Encryption | AES-256-GCM, a fresh random nonce per record, tampering detected on open. |
+| Key at rest | Never written. Only the cost, the salt and a sealed check value are on disk. The key is wiped from memory on lock. |
+| Project files | One sealed record per file, listed by a sealed manifest. Record names are a keyed hash of the path, so a name can't be matched against a guessed path. |
+| Chats, keys, settings | The agent's database is sealed with the project. While unlocked it exists only in memory (`/dev/shm`), never on disk. |
+| Working copy | Tools need real files, so while a project is unlocked its files are plaintext under `.anoncode/projects/<id>/run/work`. Locking seals what changed and wipes it. |
+| After a crash | The leftover working copy is sealed at the next unlock before anything else. |
+| Recovery | None. A lost passphrase means the project is gone. |
 
-```bash
-# macOS (Homebrew)
-brew install --cask opencode-desktop
+Everything AnonCode stores is under `.anoncode/` in this folder. Vaults made by the first
+AnonCode (same scrypt and AES-256-GCM format) still open.
+
+**What it does not protect.** How many files a project has, roughly how big each is and when it
+last changed are visible on disk, as are project names. While a project is unlocked, anything
+running as you can read its working copy. A power cut loses chat history since the last lock or
+"Save to vault". The agent's plan folder (`~/.opencode/plan`) and its terminal sockets (`/tmp`)
+are outside the vault, and so is `.anoncode/cache`, which holds the agent's compiled code and
+downloaded tools, not your data.
+
+## FOCUS
+
+When a chat outgrows 60% of the model's context window, whole spans of it (an assistant message
+with its tool results) are left out of what the model is sent. What stays is sent word for
+word; nothing is summarised. Every message of yours, every error and the most recent spans
+always stay. The stored chat is never changed. `/focus` shows what was left out, `/focus off`
+sends everything again. From "Training-Free Decision-Preserving Context Compression"
+(arXiv:2609.37590).
+
+## What's missing
+
+- A diff view, a terminal and renaming chats.
+- Replies update by asking the agent about twice a second, not by streaming.
+- FOCUS uses only its offline scoring, not the paper's model-backed one.
+- Linux only so far.
+
+## Development
+
+```sh
+cd packages/anoncode
+cargo test --release --no-default-features    # the vault, the file tree, FOCUS
+cargo build --release                         # the app
 ```
 
-#### Installation Directory
+`--features selftest` builds an app that can press its own buttons from a script
+(`ANONCODE_SELFTEST`, described in `src/gui.rs`).
 
-The install script installs OpenCode to `$HOME/.opencode/bin`.
+## License
 
-### Agents
-
-OpenCode includes two built-in agents you can switch between with the `Tab` key.
-
-- **build** - Default, full-access agent for development work
-- **plan** - Read-only agent for analysis and code exploration
-  - Denies file edits by default
-  - Asks permission before running bash commands
-  - Ideal for exploring unfamiliar codebases or planning changes
-
-Also included is a **general** subagent for complex searches and multistep tasks.
-This is used internally and can be invoked using `@general` in messages.
-
-Learn more about [agents](https://opencode.ai/docs/agents).
-
-### Documentation
-
-For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/docs).
-
-### Contributing
-
-If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
-
-### Building on OpenCode
-
-If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
-
----
-
-**Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
+MIT, as is opencode. See [LICENSE](LICENSE).

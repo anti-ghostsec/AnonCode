@@ -1,0 +1,14 @@
+#!/bin/sh
+# Starts AnonCode: builds the app the first time (or after its source changed), then opens its window.
+set -e
+root=$(cd "$(dirname "$0")" && pwd)
+bin="$root/packages/anoncode/target/release/anoncode"
+if [ ! -x "$bin" ] || [ -n "$(find "$root/packages/anoncode/src" "$root/packages/anoncode/Cargo.toml" -newer "$bin" -print -quit)" ]; then
+  echo "Building AnonCode..." >&2
+  cargo build --release --manifest-path "$root/packages/anoncode/Cargo.toml"
+fi
+if [ ! -d "$root/node_modules" ]; then
+  echo "Installing the agent's dependencies..." >&2
+  (cd "$root" && bun install --ignore-scripts)
+fi
+ANONCODE_ROOT="$root" exec "$bin" "$@"
