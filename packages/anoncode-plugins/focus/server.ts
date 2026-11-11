@@ -11,6 +11,12 @@ import { Plugin } from "@opencode/plugin"
  * it which to keep, and removes the rest from the outgoing request. Stored history is never changed: `/focus off`
  * sends everything again.
  *
+ * With the draft model on (Settings, "FOCUS decides with: the model"), the paper's method runs: the chat's own model
+ * sketches the next steps several times (rollouts), each step citing the parts of the conversation it needs; how
+ * often a part is cited is its score. Then the model reviews the parts about to be left out and rescues any whose loss
+ * would make the agent repeat a mistake or lose state it still needs. If a model call fails, the offline guess is
+ * used for that compression instead.
+ *
  * A span that was left out stays out for the rest of the session, so the start of the request does not change from
  * step to step and the provider's prompt cache keeps working.
  */
@@ -27,12 +33,16 @@ type Report = {
   kept: string[]
   decisions: { id: string; kind: string; tokens: number; score: number; kept: boolean; reasons: string[] }[]
 }
-type SessionState = { off: boolean; dropped: string[]; last?: { at: number; total: number; kept: number; dropped: number; budget: number } }
+type SessionState = { off: boolean; dropped: string[]; last?: { at: number; total: number; kept: number; dropped: number; budget: number; by?: string } }
 
 const PREFIX = "session:"
 const DEFAULT_SHARE = 0.6
 const FALLBACK_BUDGET = 100_000
 const KEEP_RECENT = 6
+/** How much of each part the draft model is shown. */
+const PREVIEW = 220
+/** The reviewer loop's own messages start like this (see the loop plugin). */
+const LOOP_MESSAGE = /^\*\*(Loop started\.|Loop resumed\.|Reviewer, round \d+|Reviewer: the loop)/
 
 function partText(part: Part) {
   if (part.type === "text" || part.type === "reasoning") return part.text ?? ""
@@ -58,12 +68,13 @@ function estimate(message: LlmMessage) {
 /** An assistant message and the tool results after it are one span, so a call is never sent without its result. */
 export function buildSpans(messages: ReadonlyArray<LlmMessage>): Span[] {
   const spans: Span[] = []
-  const make = (kind: string, group: LlmMessage[]) => {
+  const make = (kind: string, first: LlmMessage, rest: LlmMessage[] = []) => {
+    const group = [first, ...rest]
     const all = group.flatMap(parts)
     spans.push({
       // A span without a stored id can't be remembered between steps, so it is treated as system and always kept.
-      id: group[0].id ?? `unnamed-${spans.length}`,
-      kind: group[0].id && !all.some((part) => part.type === "compaction") ? kind : "system",
+      id: first.id ?? `unnamed-${spans.length}`,
+      kind: first.id && !all.some((part) => part.type === "compaction") ? kind : "system",
       text: group.map(messageText).join("\n"),
       isError: all.some((part) => part.type === "tool-result" && /error|denied/i.test(part.result?.type ?? "")),
       tokens: group.reduce((sum, message) => sum + estimate(message), 0),
@@ -72,14 +83,16 @@ export function buildSpans(messages: ReadonlyArray<LlmMessage>): Span[] {
   }
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]
+    if (!message) continue
     if (message.role === "assistant") {
-      const group = [message]
-      while (messages[i + 1]?.role === "tool") group.push(messages[++i])
-      make("assistant", group)
+      const results: LlmMessage[] = []
+      for (let next = messages[i + 1]; next?.role === "tool"; next = messages[++i + 1]) results.push(next)
+      make("assistant", message, results)
       continue
     }
-    if (message.role === "user") make(spans.some((span) => span.kind.startsWith("user")) ? "user" : "user_goal", [message])
-    else make(message.role === "system" ? "system" : "tool_result", [message])
+    if (message.role === "user" && LOOP_MESSAGE.test(messageText(message).trimStart())) make("loop", message)
+    else if (message.role === "user") make(spans.some((span) => span.kind.startsWith("user")) ? "user" : "user_goal", message)
+    else make(message.role === "system" ? "system" : "tool_result", message)
   }
   return spans
 }
@@ -93,10 +106,73 @@ async function decide(request: unknown): Promise<Report | undefined> {
   return JSON.parse(out)
 }
 
+type Model = NonNullable<Parameters<Plugin.Context["experimental"]["generate"]["text"]>[0]["model"]>
+type Generate = (input: { prompt: string; model: Model }) => Promise<{ text: string }>
+
+/** The paper's Monte Carlo rollouts: each drafted plan cites the parts it depends on. */
+async function draftCitations(generate: Generate, model: Model, spans: Span[], task: string, rollouts: number) {
+  const alias = aliases(spans)
+  const prompt = [
+    "You are planning the next actions for a coding task.",
+    `Task:\n${task}`,
+    "",
+    "Conversation so far, one part per line:",
+    ...spans.map((span, i) => `${alias.names[i]} [${span.kind}] ${preview(span.text)}`),
+    "",
+    "Sketch the steps you would take next. For each step write one line:",
+    "Step: <what you would do> | Depends on: [<part names you actually need, like p3, p7>]",
+    "Cite a part only if that step truly needs what it says.",
+  ].join("\n")
+  return Promise.all(
+    Array.from({ length: rollouts }, () =>
+      generate({ prompt, model }).then((reply) => cited(reply.text, /depends on:\s*\[([^\]]*)\]/gi, alias.ids)),
+    ),
+  )
+}
+
+/** The paper's defensive verification: which parts about to be left out must stay. */
+async function draftRescue(generate: Generate, model: Model, spans: Span[], task: string) {
+  if (spans.length === 0) return []
+  const alias = aliases(spans)
+  const prompt = [
+    "You are checking a context-compression decision for a coding task.",
+    `Task:\n${task}`,
+    "",
+    "These parts of the conversation are about to be left out of what the agent sees:",
+    ...spans.map((span, i) => `${alias.names[i]} [${span.kind}] ${preview(span.text)}`),
+    "",
+    "Name only those whose removal would make the agent repeat a mistake, loop, or lose state it still needs",
+    "(a failed attempt, a rejected request, a decision or constraint stated earlier).",
+    "Answer with one line: Rescue: [<part names>]. An empty list is fine.",
+  ].join("\n")
+  const reply = await generate({ prompt, model })
+  return cited(reply.text, /rescue:\s*\[([^\]]*)\]/gi, alias.ids)
+}
+
+/** Short names (p1, p2, ...) the model can repeat reliably, and the span ids they stand for. */
+function aliases(spans: Span[]) {
+  const pairs = spans.map((span, i) => [`p${i + 1}`, span.id] as const)
+  return { names: pairs.map((pair) => pair[0]), ids: new Map(pairs) }
+}
+
+function cited(text: string, pattern: RegExp, ids: Map<string, string>) {
+  return [...text.matchAll(pattern)].flatMap((match) =>
+    (match[1] ?? "").split(/[,\s]+/).flatMap((name) => {
+      const id = ids.get(name.trim().toLowerCase())
+      return id ? [id] : []
+    }),
+  )
+}
+
+function preview(text: string) {
+  const flat = text.replace(/\s+/g, " ").trim()
+  return flat.length <= PREVIEW ? flat : flat.slice(0, PREVIEW) + "…"
+}
+
 export default Plugin.define({
   id: "anoncode-focus",
   async setup(ctx) {
-    const options = (ctx.options ?? {}) as { budgetTokens?: number; share?: number; keepRecent?: number; tau?: number }
+    const configured = (ctx.options ?? {}) as { budgetTokens?: number; share?: number; keepRecent?: number; tau?: number }
     const sessions = new Map<string, SessionState>()
     const limits = new Map<string, number>()
 
@@ -118,20 +194,45 @@ export default Plugin.define({
       // ANONCODE_FOCUS_BUDGET forces a budget, to see compression on a short conversation.
       const forced = Number(process.env.ANONCODE_FOCUS_BUDGET)
       if (forced > 0) return forced
-      if (options.budgetTokens) return options.budgetTokens
+      if (configured.budgetTokens) return configured.budgetTokens
       const share = Number(process.env.ANONCODE_FOCUS_SHARE) / 100
       const key = `${model.providerID}/${model.id}`
       if (!limits.has(key)) {
         const listed = await ctx.model.list().catch(() => undefined)
         const found = (listed?.data ?? []).find((item) => item.providerID === model.providerID && item.id === model.id)
         const window = found ? Math.min(found.limit.input ?? found.limit.context, found.limit.context) : 0
-        limits.set(key, window > 0 ? Math.floor(window * (share > 0 ? share : (options.share ?? DEFAULT_SHARE))) : FALLBACK_BUDGET)
+        limits.set(key, window > 0 ? Math.floor(window * (share > 0 ? share : (configured.share ?? DEFAULT_SHARE))) : FALLBACK_BUDGET)
       }
       return limits.get(key) ?? FALLBACK_BUDGET
     }
 
     // Switched off for every project in AnonCode's Settings.
     const disabled = process.env.ANONCODE_FOCUS === "off"
+    const useModel = process.env.ANONCODE_FOCUS_DRAFT !== "quick"
+    const rollouts = Math.min(5, Math.max(1, Number(process.env.ANONCODE_FOCUS_ROLLOUTS) || 3))
+    const generate: Generate = (input) => ctx.experimental.generate.text({ prompt: input.prompt, model: input.model })
+
+    /** The decision, and how it was made, for `/focus`. */
+    const compress = async (live: Span[], task: string, limit: number, model: Model) => {
+      const spans = live.map((span) => ({ id: span.id, kind: span.kind, text: span.text, isError: span.isError, tokens: span.tokens }))
+      const options = { memoryBudgetTokens: limit, keepRecent: configured.keepRecent ?? KEEP_RECENT, tau: configured.tau ?? 0.3, rollouts }
+      const offline = async (by: string) => ({ report: await decide({ spans, task, options: { ...options, hardCapTokens: limit } }), by })
+      if (!useModel) return offline("the offline guess")
+      const drafted = await draftCitations(generate, model, live, task, rollouts).catch((error: unknown) => {
+        console.warn("[anoncode-focus] the draft model failed, using the offline guess:", error)
+        return error instanceof Error ? error.message : String(error)
+      })
+      if (typeof drafted === "string") return offline(`the offline guess, because the model call failed (${drafted.slice(0, 160)})`)
+      // Before the cap: what the plans and the defensive rules would leave out is what the model reviews.
+      const first = await decide({ spans, task, options, cited: drafted })
+      const kept = new Set(first?.kept ?? [])
+      const rescued = await draftRescue(generate, model, live.filter((span) => !kept.has(span.id)), task).catch(() => undefined)
+      const cites = new Set(drafted.flat()).size
+      return {
+        report: await decide({ spans, task, options: { ...options, hardCapTokens: limit }, cited: drafted, rescued: rescued ?? [] }),
+        by: `the chat's model: ${rollouts} drafted plans citing ${cites} of ${live.length} parts, ${rescued === undefined ? "review failed" : `${rescued.length} rescued in review`}`,
+      }
+    }
     await ctx.session.hook("context", async (event) => {
       if (disabled) return
       const current = await state(event.sessionID)
@@ -142,24 +243,19 @@ export default Plugin.define({
       const limit = await budget(event.model)
       const total = live.reduce((sum, span) => sum + span.tokens, 0)
       const users = live.filter((span) => span.kind.startsWith("user"))
-      const report =
-        total > limit
-          ? await decide({
-              spans: live.map((span) => ({ id: span.id, kind: span.kind, text: span.text, isError: span.isError, tokens: span.tokens })),
-              task: [users[0]?.text, users.at(-1)?.text].filter(Boolean).join("\n"),
-              options: { memoryBudgetTokens: limit, hardCapTokens: limit, keepRecent: options.keepRecent ?? KEEP_RECENT, tau: options.tau ?? 0.3 },
-            }).catch((error) => {
-              console.warn("[anoncode-focus] left the conversation as it is:", error)
-              return undefined
-            })
-          : undefined
+      const task = [users[0]?.text, users.length > 1 ? users.at(-1)?.text : undefined].filter(Boolean).join("\n")
+      const decided = total > limit ? await compress(live, task, limit, event.model).catch((error) => {
+        console.warn("[anoncode-focus] left the conversation as it is:", error)
+        return undefined
+      }) : undefined
+      const report = decided?.report
       if (report?.triggered && report.droppedCount > 0) {
         const kept = new Set(report.kept)
         for (const span of live) if (!kept.has(span.id)) gone.add(span.id)
         await save(event.sessionID, {
           off: false,
           dropped: [...gone],
-          last: { at: Date.now(), total: report.totalTokens, kept: report.keptTokens, dropped: report.droppedCount, budget: limit },
+          last: { at: Date.now(), total: report.totalTokens, kept: report.keptTokens, dropped: report.droppedCount, budget: limit, by: decided?.by },
         })
       }
       if (gone.size === 0) return
@@ -189,8 +285,10 @@ export default Plugin.define({
                 ? "Nothing has been left out yet."
                 : `${current.dropped.length} spans are left out of what the model is sent. They are still in the conversation here.`,
               last
-                ? `Last compression: ${last.total.toLocaleString()} tokens down to ${last.kept.toLocaleString()} (budget ${last.budget.toLocaleString()}), ${last.dropped} spans left out, at ${new Date(last.at).toLocaleTimeString()}.`
+                ? `Last compression: ${last.total.toLocaleString()} tokens down to ${last.kept.toLocaleString()} (budget ${last.budget.toLocaleString()}), ${last.dropped} spans left out, at ${new Date(last.at).toLocaleTimeString()}.${last.by ? `\nDecided by ${last.by}.` : ""}`
                 : undefined,
+              "",
+              last ? undefined : useModel ? `It decides with the chat's model (${rollouts} drafted plans and a review).` : "It decides with the offline guess.",
               "",
               "/focus off     send the whole conversation again",
               "/focus on      compress when over budget",

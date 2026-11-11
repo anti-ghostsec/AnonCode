@@ -12,14 +12,17 @@
 //!    repeated if lost: errors, every user message, system spans, the most
 //!    recent spans, and anything the draft model asked to rescue.
 //! 4. Kept spans stay verbatim, in order. Nothing is summarised.
-//! 5. Optionally, if still over a hard cap, the lowest-scoring spans that
-//!    aren't protected are dropped until it fits.
+//! 5. Optionally, if still over a hard cap, spans are dropped until it
+//!    fits: unprotected ones first, then older reviewer-loop messages, then
+//!    older instructions, errors and rescues. The goal, the latest
+//!    instruction, system spans and the recent spans are never dropped.
 //!
 //! Every decision is in the report, with its reasons.
 //!
-//! The draft model here is the offline heuristic (word overlap with the
-//! task, recency, errors). A caller with a real model passes its citations
-//! in `cited` and its rescues in `rescued` instead.
+//! Without `cited`, the draft model is the offline heuristic (word overlap
+//! with the task, recency, errors). The focus plugin, with a real model,
+//! passes each rollout's citations in `cited` and the defensive review's
+//! rescues in `rescued`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,7 +31,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize)]
 pub struct Span {
     pub id: String,
-    /// `user_goal`, `user`, `assistant`, `tool_result` or `system`.
+    /// `user_goal`, `user`, `loop` (a reviewer-loop message), `assistant`,
+    /// `tool_result` or `system`.
     pub kind: String,
     #[serde(default)]
     pub text: String,
@@ -102,6 +106,18 @@ pub struct Report {
     /// Ids of the spans to keep, in order.
     pub kept: Vec<String>,
     pub decisions: Vec<Decision>,
+}
+
+/// How strongly the defensive pass protects a span, weakest first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Level {
+    None,
+    /// A reviewer-loop message: each restates the mission, so older ones are the first protected spans to go.
+    Loop,
+    /// Older instructions, errors and draft-model rescues.
+    Soft,
+    /// The goal, the latest instruction, system parts and recent spans.
+    Hard,
 }
 
 pub fn estimate_tokens(text: &str) -> u64 {
@@ -191,6 +207,9 @@ pub fn compress(req: &Request) -> Report {
     let rescued: BTreeSet<&str> = req.rescued.iter().map(String::as_str).collect();
     let recent_start = req.spans.len().saturating_sub(opts.keep_recent);
 
+    // The latest real instruction from the user is never dropped.
+    let last_user = req.spans.iter().rposition(|s| s.kind == "user" || s.kind == "user_goal");
+    let mut levels = Vec::with_capacity(req.spans.len());
     let mut decisions: Vec<Decision> = req
         .spans
         .iter()
@@ -198,39 +217,54 @@ pub fn compress(req: &Request) -> Report {
         .map(|(i, s)| {
             let score = f64::from(counts.get(s.id.as_str()).copied().unwrap_or(0)) / n;
             let mut reasons = Vec::new();
+            let mut level = Level::None;
+            let mut raise = |l: Level, why: &str| {
+                level = level.max(l);
+                reasons.push(why.to_string());
+            };
             if s.is_error {
-                reasons.push("defensive: error/failure".to_string());
+                raise(Level::Soft, "defensive: error/failure");
             }
             match s.kind.as_str() {
-                "user_goal" => reasons.push("defensive: task goal".into()),
-                "user" => reasons.push("defensive: user instruction".into()),
-                "system" => reasons.push("defensive: system".into()),
+                "user_goal" => raise(Level::Hard, "defensive: task goal"),
+                "user" if Some(i) == last_user => raise(Level::Hard, "defensive: latest user instruction"),
+                "user" => raise(Level::Soft, "defensive: user instruction"),
+                "loop" => raise(Level::Loop, "defensive: reviewer loop message"),
+                "system" => raise(Level::Hard, "defensive: system"),
                 _ => {}
             }
             if i >= recent_start {
-                reasons.push("defensive: recent state".into());
+                raise(Level::Hard, "defensive: recent state");
             }
             if rescued.contains(s.id.as_str()) {
-                reasons.push("defensive: draft-model rescue".into());
+                raise(Level::Soft, "defensive: draft-model rescue");
             }
-            let protected = !reasons.is_empty();
+            let protected = level != Level::None;
             let cited = score >= opts.tau;
             reasons.push(format!("utility {score:.2} {} tau {}", if cited { ">=" } else { "<" }, opts.tau));
+            levels.push(level);
             Decision { id: s.id.clone(), kind: s.kind.clone(), index: i, tokens: tokens[i], score, kept: protected || cited, protected, reasons }
         })
         .collect();
 
+    // Over the hard cap, spans are dropped in rounds until it fits: first
+    // what nothing protects, then older reviewer-loop messages, then older
+    // instructions, errors and rescues. Within a round the lowest utility
+    // goes first, oldest first on a tie. The goal, the latest instruction,
+    // system parts and the recent spans always stay.
     if let Some(cap) = opts.hard_cap_tokens {
         let mut kept_tokens: u64 = decisions.iter().filter(|d| d.kept).map(|d| d.tokens).sum();
-        let mut droppable: Vec<usize> = decisions.iter().filter(|d| d.kept && !d.protected).map(|d| d.index).collect();
-        droppable.sort_by(|&a, &b| decisions[a].score.partial_cmp(&decisions[b].score).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-        for i in droppable {
-            if kept_tokens <= cap {
-                break;
+        for (round, why) in [(Level::None, "dropped: over hard cap"), (Level::Loop, "dropped: over hard cap, older loop message"), (Level::Soft, "dropped: over hard cap, though defensive")] {
+            let mut droppable: Vec<usize> = decisions.iter().filter(|d| d.kept && levels[d.index] == round).map(|d| d.index).collect();
+            droppable.sort_by(|&a, &b| decisions[a].score.partial_cmp(&decisions[b].score).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+            for i in droppable {
+                if kept_tokens <= cap {
+                    break;
+                }
+                decisions[i].kept = false;
+                decisions[i].reasons.push(why.into());
+                kept_tokens -= decisions[i].tokens;
             }
-            decisions[i].kept = false;
-            decisions[i].reasons.push("dropped: over hard cap".into());
-            kept_tokens -= decisions[i].tokens;
         }
     }
 

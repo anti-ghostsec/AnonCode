@@ -170,6 +170,30 @@ impl Client {
         self.call("DELETE", &format!("/api/credential/{}", percent(credential)), None).map(|_| ())
     }
 
+    /// The server's live event stream (server-sent events), one JSON event
+    /// per `data:` line. Blocks until the server closes it.
+    pub fn events(&self, mut each: impl FnMut(Value)) -> ApiResult<()> {
+        use std::io::BufRead;
+        // No read timeout: the stream is quiet while nothing happens.
+        let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)).build();
+        let response = agent
+            .get(&format!("{}/api/event", self.base))
+            .set("authorization", &self.auth)
+            .set("x-opencode-directory", &percent(&self.directory))
+            .set("accept", "text/event-stream")
+            .call()
+            .map_err(|e| e.to_string())?;
+        for line in std::io::BufReader::new(response.into_reader()).lines() {
+            let line = line.map_err(|e| e.to_string())?;
+            if let Some(data) = line.strip_prefix("data:") {
+                if let Ok(event) = serde_json::from_str(data.trim_start()) {
+                    each(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Requests waiting for the user's yes or no.
     pub fn permissions(&self) -> ApiResult<Vec<Value>> {
         self.list("/api/permission/request")

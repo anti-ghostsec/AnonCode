@@ -54,6 +54,8 @@ pub struct ProjectPaths {
     pub home: PathBuf,
     /// The agent's scratch files and its log, beside `home`.
     pub scratch: PathBuf,
+    /// Build caches, in plaintext on disk while unlocked.
+    pub cache: PathBuf,
 }
 
 /// The registry, rooted at a `.anoncode` folder.
@@ -132,7 +134,7 @@ impl Projects {
         let dir = self.dir().join(id);
         let run = dir.join("run");
         let private = memory_dir(&dir).unwrap_or_else(|| run.clone());
-        Ok(ProjectPaths { vault_file: dir.join("vault.json"), work: run.join("work"), home: private.join("home"), scratch: private, run, dir })
+        Ok(ProjectPaths { vault_file: dir.join("vault.json"), work: run.join("work"), home: private.join("home"), scratch: private, cache: run.join("cache"), run, dir })
     }
 
     /// Creates a project and its vault, locked to `passphrase`.

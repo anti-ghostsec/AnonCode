@@ -21,7 +21,8 @@ own cost. It can use a different model.
 /loop model <provider/model>      use another model for the reviewer
 /loop model default               use the agent's model for the reviewer
 /loop cost <usd|default>          combined chat + reviewer cost limit
-/loop time <minutes|default>      wall-clock limit
+/loop for <time> <review>         arm for a limited time (30m, 2h, 1h30m, 5 hours)
+/loop time <time|default>         change the time limit
 /loop note <text>                 queue a note while it runs
 /loop                             show status
 /loop pause | resume | clear
@@ -32,7 +33,9 @@ In the AnonCode window the same controls are behind the **Loop…** button.
 ## What the reviewer is given
 
 1. Its instructions.
-2. The mission, captured when the loop was armed.
+2. The mission: the one given to `/loop`, or else your latest message when the loop was armed,
+   together with any you sent just before it with no reply in between. Older, already answered
+   requests are not part of it.
 3. The agent's last message of the turn.
 4. That turn's tool calls and their output.
 5. New messages from you in that turn.
@@ -40,5 +43,8 @@ In the AnonCode window the same controls are behind the **Loop…** button.
 ## Limits
 
 - 50 rounds at most; three rounds without progress pause the loop.
-- Optional cost and time limits pause it too. Resume starts a fresh time budget.
+- Optional cost and time limits pause it too: `/loop for 2h <rules>` arms it for two hours, and
+  `/loop time 1h30m` changes the limit of a running loop, counted from now. Times are written
+  like 30m, 2h, 1h30m, 5 hours or 1 day; a bare number is minutes. When the time is up the
+  loop stops the agent and says so in the chat. Resume starts a fresh time budget.
 - A restart, an interruption, a failed turn or an unreadable reviewer reply pauses it.

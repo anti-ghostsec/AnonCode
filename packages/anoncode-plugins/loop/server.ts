@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin"
+import { duration, takeDuration } from "./duration"
 import { Definition, type State as LoopState } from "./rpc"
 
 /**
@@ -41,7 +42,8 @@ const USAGE = [
   "  /loop model <provider/model>            use another model for the reviewer",
   "  /loop model default                     use the worker's model for the reviewer",
   "  /loop cost <usd|default>                combined cost limit",
-  "  /loop time <minutes|default>            wall-clock limit",
+  "  /loop for <duration> <review>           arm for a limited time (30m, 2h, 1h30m, 5 hours, 1 day)",
+  "  /loop time <duration|default>           change the time limit (a bare number is minutes)",
   "  /loop note <text>                       queue a mission note while it runs",
   "  /loop                                   show the loop status",
   "  /loop pause | resume | clear",
@@ -169,7 +171,7 @@ export default Plugin.define({
       deadlineTimers.set(
         sessionID,
         setTimeout(() => {
-          void stopForLimit(sessionID, `Time limit reached (${state.timeLimit} minutes)`).catch(() => undefined)
+          void stopForLimit(sessionID, `Time limit reached (${duration(state.timeLimit ?? 0)})`).catch(() => undefined)
         }, remaining),
       )
     }
@@ -189,13 +191,20 @@ export default Plugin.define({
       clearDeadline(sessionID)
       await stopReviewer(sessionID)
       await ctx.session.interrupt({ sessionID, resume: false }).catch(() => undefined)
+      // Said in the chat, so the stop is not silent.
+      await ctx.session.prompt({
+        sessionID,
+        text: render(LIMIT_MESSAGE, { reason }),
+        metadata: { source: "loop", loopID: state.id },
+        delivery: "queue",
+      })
     }
 
     const enforceLimits = async (sessionID: string) => {
       const state = await read(sessionID)
       if (state?.status !== "active") return
       if (state.deadline && Date.now() >= state.deadline) {
-        await stopForLimit(sessionID, `Time limit reached (${state.timeLimit} minutes)`)
+        await stopForLimit(sessionID, `Time limit reached (${duration(state.timeLimit ?? 0)})`)
         return
       }
       if (state.costLimit !== undefined && (await spent(sessionID, state)) >= state.costLimit) {
@@ -215,17 +224,21 @@ export default Plugin.define({
         .some((message) => message.type === "assistant" && message.content.some((part) => part.type === "tool"))
     }
 
-    /** The user's request at arm time is the baseline the reviewer compares against for goal drift. */
+    /**
+     * The user's request at arm time is the baseline the reviewer compares against for goal drift: their latest
+     * message, plus the ones sent just before it with no reply in between (a request split over a few messages).
+     * Anything older was already answered and belongs to earlier work.
+     */
     const captureGoal = async (sessionID: string) => {
       const messages = await ctx.session.context({ sessionID })
-      return messages
-        .flatMap((message) =>
-          message.type === "user" && message.text && message.metadata?.source !== "loop" ? [message.text.trim()] : [],
-        )
-        .filter((text) => text && !text.startsWith("/loop"))
-        .slice(-6)
-        .join("\n\n")
-        .slice(-MAX_GOAL)
+      const request: string[] = []
+      for (const message of messages.toReversed()) {
+        if (message.type === "assistant" && request.length > 0) break
+        if (message.type !== "user" || message.metadata?.source === "loop") continue
+        const text = message.text?.trim()
+        if (text && !text.startsWith("/")) request.unshift(text)
+      }
+      return request.join("\n\n").slice(-MAX_GOAL)
     }
 
     const startLoop = async (input: {
@@ -544,11 +557,15 @@ export default Plugin.define({
           if (control === "resume") return resumeLoop(input.sessionID)
           if (control === "clear") return clearLoop(input.sessionID)
 
-          if (control === "start" || control.startsWith("start ")) {
-            const start = splitStart(text.slice("start".length).trim())
+          if (control === "start" || control.startsWith("start ") || control.startsWith("for ")) {
+            const rest = control.startsWith("for ") ? text : text.slice("start".length).trim()
+            const timed = rest.toLowerCase().startsWith("for ") ? takeDuration(rest.slice("for ".length)) : undefined
+            // "/loop for <time> ..." needs a time; after "start", "for ..." may just be how the rules begin.
+            if (control.startsWith("for ") && !timed) throw new Error("Give the time as for example 30m, 2h, 1h30m, 5 hours or 1 day.")
             return startLoop({
               sessionID: input.sessionID,
-              ...start,
+              ...splitStart(timed ? timed.rest : rest),
+              ...(timed ? { timeLimit: timed.minutes } : {}),
               delivery: input.delivery,
             })
           }
@@ -618,8 +635,9 @@ export default Plugin.define({
               await write(input.sessionID, { ...state, timeLimit: undefined, deadline: undefined, updatedAt: Date.now() })
               return
             }
-            const minutes = Number(value)
-            if (!Number.isFinite(minutes) || minutes <= 0) throw new Error("Use a positive number of minutes or default.")
+            const timed = takeDuration(value)
+            if (!timed || timed.rest) throw new Error("Give the time as for example 30m, 2h, 1h30m, 5 hours or 1 day, or default.")
+            const minutes = timed.minutes
             const changed = { ...state, timeLimit: minutes, deadline: Date.now() + minutes * 60_000, updatedAt: Date.now() }
             await write(input.sessionID, changed)
             armDeadline(input.sessionID, changed)
@@ -847,7 +865,7 @@ function describe(state: LoopState) {
     state.model ? `Reviewer model: ${state.model.providerID}/${state.model.id}` : undefined,
     state.reviewCost ? `Reviewer cost: $${state.reviewCost.toFixed(4)}` : undefined,
     state.costLimit ? `Cost limit: $${money(state.costLimit)}` : undefined,
-    state.timeLimit ? `Time limit: ${state.timeLimit} minutes` : undefined,
+    state.timeLimit ? `Time limit: ${duration(state.timeLimit)}${state.deadline && state.status === "active" ? `, ${duration(Math.max(0, (state.deadline - Date.now()) / 60_000))} left` : ""}` : undefined,
   ]
     .filter(Boolean)
     .join("\n")
@@ -963,6 +981,10 @@ const DONE_MESSAGE = `**Reviewer: the loop is complete.**
 \${reason}
 
 Nothing more is needed for the loop. Reply with a one-line summary and stop.`
+
+const LIMIT_MESSAGE = `**Reviewer: the loop has stopped.** \${reason}.
+
+Stop the work here and reply with one or two lines on where it stands.`
 
 const STOP_MESSAGE = `**Reviewer: the loop is \${verdict}.**
 

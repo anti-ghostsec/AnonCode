@@ -271,6 +271,38 @@ fn focus_scores_by_citation_frequency_and_honours_rescue_and_cap() {
 }
 
 #[test]
+fn focus_hard_cap_drops_old_loop_messages_then_old_instructions() {
+    let mut spans = vec![span("goal", "user_goal", "build the parser", false, 100)];
+    for i in 0..6 {
+        spans.push(span(&format!("loop{i}"), "loop", "Reviewer, round N: keep going", false, 500));
+        spans.push(span(&format!("work{i}"), "assistant", "edited files", false, 500));
+    }
+    spans.insert(2, span("old", "user", "an earlier aside", false, 400));
+    spans.push(span("latest", "user", "now add tests", false, 50));
+    spans.push(span("recent", "assistant", "running tests", false, 200));
+    let mut req = Request { spans, cited: Some(vec![vec![]]), ..Default::default() };
+    req.options.keep_recent = 2;
+    req.options.memory_budget_tokens = 1000;
+    req.options.hard_cap_tokens = Some(1000);
+    let r = focus::compress(&req);
+    assert!(r.kept_tokens <= 1000, "kept {} tokens", r.kept_tokens);
+    for id in ["goal", "latest", "recent"] {
+        assert!(r.kept.iter().any(|k| k == id), "{id} was dropped");
+    }
+    // Loop messages go before the older instruction does.
+    let gone = |id: &str| !r.kept.iter().any(|k| k == id);
+    assert!(gone("loop0") && gone("loop5"));
+
+    // With room for it, the older instruction stays while loop messages go.
+    req.options.hard_cap_tokens = Some(800);
+    req.options.memory_budget_tokens = 800;
+    req.spans.retain(|s| !s.id.starts_with("work"));
+    let r = focus::compress(&req);
+    assert!(r.kept.iter().any(|k| k == "old"));
+    assert!(!r.kept.iter().any(|k| k.starts_with("loop")));
+}
+
+#[test]
 fn focus_heuristic_prefers_spans_about_the_task() {
     let mut spans: Vec<Span> = (0..12).map(|i| span(&format!("n{i}"), "assistant", "weather small talk", false, 1500)).collect();
     spans[1] = span("hit", "assistant", "the tokenizer splits identifiers wrongly", false, 1500);
@@ -369,4 +401,15 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         if p.is_dir() { out.extend(walk(&p)) } else { out.push(p) }
     }
     out
+}
+
+#[test]
+fn tool_calls_written_as_text_are_left_out() {
+    use anoncode::tidy::tidy;
+    let raw = "Now the files. <｜DSML｜ calls> <｜DSML｜ invoke name=\"write\"> <｜DSML｜ parameter name=\"path\" string=\"true\">a.py</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls> Done.";
+    assert_eq!(tidy(raw), "Now the files. Done.");
+    assert_eq!(tidy("Running it. <｜DSML｜ calls> <｜DSML｜ invoke name=\"shell\"> cd /work && py"), "Running it.");
+    assert_eq!(tidy("ok<｜end▁of▁sentence｜>"), "ok");
+    assert_eq!(tidy("a <tag> and | bars"), "a <tag> and | bars");
+    assert_eq!(tidy("x <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜> y"), "x y");
 }

@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroize;
 
 use crate::api::Client;
-use crate::supervisor::{Access, Approvals, Config, Manager, ProjectView, Provider, Settings};
+use crate::supervisor::{Access, AgentPart, Approvals, Config, FocusDraft, Manager, ProjectView, Provider, Settings};
 use crate::Result;
 
 /// Set by Ctrl+C and friends: close the window, which locks everything.
@@ -43,6 +43,8 @@ enum Msg {
     Unlocked { id: String, error: Option<String> },
     Sessions { id: String, list: Vec<Value> },
     Messages { id: String, session: String, list: Vec<Value> },
+    /// Streamed text of a reply still being written.
+    Delta { id: String, session: String, message: String, ordinal: u64, reasoning: bool, delta: String },
     Permissions { id: String, list: Vec<Value> },
     Models { id: String, list: Vec<Value> },
     Integrations { id: String, list: Vec<Value> },
@@ -50,6 +52,8 @@ enum Msg {
     /// A chat was started for a first message.
     Started { id: String, session: String },
     Notice { id: String, text: String },
+    /// The desktop's file chooser was closed. `None`: there is none.
+    Picked { id: String, folder: bool, paths: Option<Vec<PathBuf>> },
 }
 
 /// What the poller thread shares with the interface.
@@ -57,6 +61,12 @@ struct Shared {
     stop: AtomicBool,
     /// Fetch models, providers and chats again on the next round.
     refresh: AtomicBool,
+    /// Something changed on the server: fetch now instead of waiting.
+    wake: AtomicBool,
+    /// The chat list changed.
+    sessions_changed: AtomicBool,
+    /// The event stream is connected, so the poller can wait longer.
+    streaming: AtomicBool,
     session: Mutex<String>,
 }
 
@@ -66,6 +76,9 @@ struct Tab {
     shared: Arc<Shared>,
     sessions: Vec<Value>,
     messages: Vec<Value>,
+    /// Text streamed for reply parts not stored yet: `(message, ordinal)`
+    /// to whether it is thinking, and the text so far.
+    live: BTreeMap<(String, u64), (bool, String)>,
     permissions: Vec<Value>,
     models: Vec<Value>,
     integrations: Vec<Value>,
@@ -92,7 +105,8 @@ enum Dialog {
     Delete { id: String, name: String, typed: String },
     Export { id: String, dir: String },
     Import { id: String, dir: String },
-    Loop { id: String, review: String },
+    /// `time`: how long the loop may run ("2h", "30m"); empty for no limit.
+    Loop { id: String, review: String, time: String },
     /// Choosing files to attach: the folder shown and what is in it.
     Attach { id: String, dir: PathBuf, typed: String, entries: Vec<(String, bool)> },
 }
@@ -107,6 +121,35 @@ fn entries(dir: &std::path::Path) -> Vec<(String, bool)> {
         .collect();
     list.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
     list
+}
+
+/// Opens the desktop's own file chooser (zenity, or kdialog on KDE) off the
+/// interface thread, and reports what was chosen in [`Msg::Picked`].
+fn pick(tx: &Sender<Msg>, ctx: &egui::Context, id: &str, title: &str, folder: bool) {
+    let (tx, ctx, id, title) = (tx.clone(), ctx.clone(), id.to_string(), title.to_string());
+    std::thread::spawn(move || {
+        let start = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+        let start = format!("{}/", start.display());
+        let zenity: Vec<String> = if folder {
+            vec!["--file-selection".into(), "--directory".into(), format!("--title={title}"), format!("--filename={start}")]
+        } else {
+            vec!["--file-selection".into(), "--multiple".into(), "--separator=\n".into(), format!("--title={title}"), format!("--filename={start}")]
+        };
+        let kdialog: Vec<String> = if folder {
+            vec!["--title".into(), title.clone(), "--getexistingdirectory".into(), start.clone()]
+        } else {
+            vec!["--title".into(), title.clone(), "--getopenfilename".into(), start.clone(), "--multiple".into(), "--separate-output".into()]
+        };
+        let kde = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.to_uppercase().contains("KDE"));
+        let order = if kde { [("kdialog", kdialog.clone()), ("zenity", zenity.clone())] } else { [("zenity", zenity), ("kdialog", kdialog)] };
+        // The first chooser that exists; it exits non-zero when closed without a choice.
+        let paths = order.into_iter().find_map(|(program, args)| {
+            let out = std::process::Command::new(program).args(&args).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+            Some(if out.status.success() { String::from_utf8_lossy(&out.stdout).lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).collect() } else { Vec::new() })
+        });
+        let _ = tx.send(Msg::Picked { id, folder, paths });
+        ctx.request_repaint();
+    });
 }
 
 fn attach_dialog(id: &str, dir: PathBuf) -> Dialog {
@@ -136,7 +179,7 @@ struct App {
     settings: Settings,
     show_settings: bool,
     /// The agent settings the open projects were started with.
-    started_with: Option<(bool, Access, Approvals, bool, u8)>,
+    started_with: Option<AgentPart>,
     /// When the user last did anything, for the auto-lock.
     last_input: std::time::Instant,
     set_filter: String,
@@ -204,7 +247,7 @@ fn poll(id: String, client: Client, shared: Arc<Shared>, tx: Sender<Msg>, ctx: e
                 send(Msg::Commands { id: id.clone(), names: list.iter().map(|c| text(c, "name")).collect() });
             }
         }
-        if round % 6 == 0 || refresh {
+        if round % 6 == 0 || refresh || shared.sessions_changed.swap(false, Ordering::SeqCst) {
             if let Ok(list) = client.sessions() {
                 if changed("sessions", &list) {
                     send(Msg::Sessions { id: id.clone(), list });
@@ -245,7 +288,52 @@ fn poll(id: String, client: Client, shared: Arc<Shared>, tx: Sender<Msg>, ctx: e
             }
         }
         round += 1;
-        std::thread::sleep(Duration::from_millis(450));
+        // With the event stream connected, changes wake this at once, so the
+        // regular check can be slow; without it, check often.
+        let wait = if shared.streaming.load(Ordering::SeqCst) { 3000 } else { 450 };
+        let mut slept = 0;
+        while slept < wait && !shared.wake.swap(false, Ordering::SeqCst) && !shared.stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(30));
+            slept += 30;
+        }
+    }
+}
+
+/// Follows one project's server events: streams the text of replies as it
+/// is written, and wakes the poller when anything else changes.
+fn stream(id: String, client: Client, shared: Arc<Shared>, tx: Sender<Msg>, ctx: egui::Context) {
+    while !shared.stop.load(Ordering::SeqCst) {
+        let result = client.events(|event| {
+            shared.streaming.store(true, Ordering::SeqCst);
+            let kind = event["type"].as_str().unwrap_or("");
+            let data = &event["data"];
+            let session = text(data, "sessionID");
+            let current = *shared.session.lock().unwrap() == session;
+            match kind {
+                "session.text.delta" | "session.reasoning.delta" if current => {
+                    let _ = tx.send(Msg::Delta {
+                        id: id.clone(),
+                        session,
+                        message: text(data, "assistantMessageID"),
+                        ordinal: data["ordinal"].as_u64().unwrap_or(0),
+                        reasoning: kind == "session.reasoning.delta",
+                        delta: text(data, "delta"),
+                    });
+                    ctx.request_repaint();
+                }
+                "session.text.delta" | "session.reasoning.delta" | "session.tool.input.delta" | "server.connected" => {}
+                "session.created" | "session.deleted" | "session.renamed" | "session.updated" | "session.archived" => {
+                    shared.sessions_changed.store(true, Ordering::SeqCst);
+                    shared.wake.store(true, Ordering::SeqCst);
+                }
+                k if k.starts_with("permission.") || current => shared.wake.store(true, Ordering::SeqCst),
+                _ => {}
+            }
+        });
+        shared.streaming.store(false, Ordering::SeqCst);
+        if result.is_err() {
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 }
 
@@ -259,14 +347,24 @@ impl Tab {
             (Some(p), Some(m)) => Some((p.to_string(), m.to_string())),
             _ => None,
         };
-        let shared = Arc::new(Shared { stop: AtomicBool::new(false), refresh: AtomicBool::new(false), session: Mutex::new(text(&saved, "session")) });
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            refresh: AtomicBool::new(false),
+            wake: AtomicBool::new(false),
+            sessions_changed: AtomicBool::new(false),
+            streaming: AtomicBool::new(false),
+            session: Mutex::new(text(&saved, "session")),
+        });
+        let (id2, c, s, tx2, ctx2) = (id.to_string(), client.clone(), shared.clone(), tx.clone(), ctx.clone());
+        std::thread::spawn(move || poll(id2, c, s, tx2, ctx2));
         let (id, c, s, tx, ctx) = (id.to_string(), client.clone(), shared.clone(), tx.clone(), ctx.clone());
-        std::thread::spawn(move || poll(id, c, s, tx, ctx));
+        std::thread::spawn(move || stream(id, c, s, tx, ctx));
         Some(Tab {
             client,
             shared,
             sessions: Vec::new(),
             messages: Vec::new(),
+            live: BTreeMap::new(),
             permissions: Vec::new(),
             models: Vec::new(),
             integrations: Vec::new(),
@@ -294,7 +392,9 @@ impl Tab {
 
     fn select(&mut self, session: &str) {
         *self.shared.session.lock().unwrap() = session.to_string();
+        self.shared.wake.store(true, Ordering::SeqCst);
         self.messages.clear();
+        self.live.clear();
         self.to_bottom = true;
         self.save_prefs();
     }
@@ -319,6 +419,7 @@ fn request(tx: &Sender<Msg>, ctx: &egui::Context, id: &str, work: impl FnOnce() 
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, manager: Manager) -> App {
+        cc.egui_ctx.add_plugin(Selected::default());
         let (tx, rx) = channel();
         let has_login = manager.has_login();
         App {
@@ -609,6 +710,23 @@ impl App {
                     if let Some(tab) = self.tabs.get_mut(&id) {
                         if tab.session() == session {
                             tab.messages = list;
+                            // Streamed text gives way to the stored text once there is some.
+                            let stored = |message: &str, ordinal: u64| {
+                                tab.messages.iter().find(|m| m["id"] == message).and_then(|m| m["content"].get(ordinal as usize)).and_then(|p| p["text"].as_str()).is_some_and(|t| !t.is_empty())
+                            };
+                            let working = tab.working();
+                            tab.live.retain(|(message, ordinal), _| working && !stored(message, *ordinal));
+                        }
+                    }
+                }
+                Msg::Delta { id, session, message, ordinal, reasoning, delta } => {
+                    if let Some(tab) = self.tabs.get_mut(&id) {
+                        if tab.session() == session {
+                            #[cfg(feature = "selftest")]
+                            if !tab.live.contains_key(&(message.clone(), ordinal)) {
+                                eprintln!("selftest: streaming {} part {ordinal} of {message}", if reasoning { "thinking" } else { "text" });
+                            }
+                            tab.live.entry((message, ordinal)).or_insert_with(|| (reasoning, String::new())).1.push_str(&delta);
                         }
                     }
                 }
@@ -654,7 +772,37 @@ impl App {
                         tab.shared.refresh.store(true, Ordering::SeqCst);
                     }
                 }
+                Msg::Picked { id, folder, paths } => match (folder, paths) {
+                    (false, Some(paths)) => {
+                        if let Some(tab) = self.tabs.get_mut(&id) {
+                            for p in paths {
+                                if !tab.attachments.contains(&p) {
+                                    tab.attachments.push(p);
+                                }
+                            }
+                        }
+                    }
+                    // No file chooser on this system: the one built in.
+                    (false, None) => {
+                        if let Some(tab) = self.tabs.get(&id) {
+                            let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| tab.client.host_dir().to_path_buf());
+                            self.dialog = Some(attach_dialog(&id, home));
+                        }
+                    }
+                    (true, Some(paths)) => {
+                        if let (Some(chosen), Some(Dialog::Export { dir, .. } | Dialog::Import { dir, .. })) = (paths.into_iter().next(), self.dialog.as_mut()) {
+                            *dir = chosen.to_string_lossy().into_owned();
+                        }
+                    }
+                    (true, None) => {
+                        if let Some(tab) = self.tabs.get_mut(&id) {
+                            tab.notice = "No file chooser was found (zenity or kdialog). Type the folder's path instead.".into();
+                        }
+                    }
+                },
                 Msg::Notice { id, text } => {
+                    #[cfg(feature = "selftest")]
+                    eprintln!("selftest: notice: {text}");
                     if let Some(tab) = self.tabs.get_mut(&id) {
                         tab.notice = text;
                     }
@@ -758,6 +906,7 @@ impl App {
             ui.label(RichText::new("A project is its own encrypted vault. It opens with your AnonCode passphrase; there is nothing else to remember.").weak());
             ui.add_space(8.0);
             let field = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("Name (shown on the tab, not encrypted)").desired_width(f32::INFINITY));
+            edit_menu(&field, &mut self.new_name, false);
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if !self.new_busy && self.new_name.is_empty() && !field.has_focus() {
                 field.request_focus();
@@ -800,9 +949,11 @@ impl App {
             }).weak());
             ui.add_space(8.0);
             let first = ui.add_enabled(!self.login_busy, TextEdit::singleline(&mut self.login_pass).password(true).hint_text("Passphrase").desired_width(f32::INFINITY));
+            edit_menu(&first, &mut self.login_pass, true);
             let mut enter = first.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) && self.has_login;
             if !self.has_login {
                 let again = ui.add_enabled(!self.login_busy, TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Passphrase again").desired_width(f32::INFINITY));
+                edit_menu(&again, &mut self.login_pass2, true);
                 enter = again.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             } else if !self.login_busy && self.login_pass.is_empty() && !first.has_focus() {
                 first.request_focus();
@@ -883,7 +1034,8 @@ impl App {
             }
             ui.separator();
             ui.label("Add a provider");
-            ui.add(TextEdit::singleline(&mut self.set_filter).hint_text("Search, or type a provider id (venice, openrouter, ollama…)").desired_width(f32::INFINITY));
+            let field = ui.add(TextEdit::singleline(&mut self.set_filter).hint_text("Search, or type a provider id (venice, openrouter, ollama…)").desired_width(f32::INFINITY));
+            edit_menu(&field, &mut self.set_filter, false);
             let needle = self.set_filter.trim().to_lowercase();
             // Until an agent has run once, only a short list is known.
             let builtin = [("venice", "Venice AI"), ("openrouter", "OpenRouter"), ("openai", "OpenAI"), ("groq", "Groq"), ("deepseek", "DeepSeek"), ("mistral", "Mistral"), ("xai", "xAI")];
@@ -904,7 +1056,8 @@ impl App {
             if !self.set_chosen.is_empty() {
                 ui.add_space(4.0);
                 ui.label(format!("API key for {}:", self.set_chosen));
-                ui.add(TextEdit::singleline(&mut self.set_key).password(true).hint_text("Paste the key (Ctrl+V)").desired_width(f32::INFINITY));
+                let field = ui.add(TextEdit::singleline(&mut self.set_key).password(true).hint_text("Paste the key (Ctrl+V)").desired_width(f32::INFINITY));
+                edit_menu(&field, &mut self.set_key, true);
                 if ui.add_enabled(!self.set_key.trim().is_empty(), egui::Button::new("Save key")).clicked() {
                     let key = std::mem::take(&mut self.set_key).trim().to_string();
                     let id = std::mem::take(&mut self.set_chosen);
@@ -941,7 +1094,22 @@ impl App {
                     ui.add(egui::Slider::new(&mut self.settings.focus_share, 30..=90).suffix("%"));
                     ui.label("of the model's context");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Decides with:");
+                    ui.radio_value(&mut self.settings.focus_draft, FocusDraft::Model, "the chat's model")
+                        .on_hover_text("The FOCUS paper's method: the model drafts plans of the next steps, each citing the parts of the chat it needs, then reviews what would be left out. A few extra model calls each time a chat is compressed.");
+                    ui.radio_value(&mut self.settings.focus_draft, FocusDraft::Quick, "a quick offline guess")
+                        .on_hover_text("Word overlap with your request, recency and errors. No extra calls, less precise.");
+                });
+                ui.add_enabled_ui(self.settings.focus_draft == FocusDraft::Model, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Plans drafted each time");
+                        ui.add(egui::Slider::new(&mut self.settings.focus_rollouts, 1..=5));
+                    });
+                });
             });
+            ui.checkbox(&mut self.settings.tool_cache, "Keep build caches between sessions (sealed)")
+                .on_hover_text("cargo's registry, npm, bun, pip and Go caches and downloaded tools are kept on disk with each project and sealed when it locks, so big builds don't start from nothing each time. Off: they live in memory and are gone when the project locks.");
             if self.settings.agent_part() != before {
                 changed = true;
             }
@@ -1011,6 +1179,7 @@ impl App {
             ui.label(RichText::new("This project was made before AnonCode had a single login and still has its own passphrase. Enter it once; after that it opens with the others.").weak());
             ui.add_space(8.0);
             let field = ui.add_enabled(!busy, TextEdit::singleline(&mut self.pass).password(true).hint_text("Passphrase").desired_width(f32::INFINITY));
+            edit_menu(&field, &mut self.pass, true);
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             if !self.pass_error.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.pass_error);
@@ -1112,7 +1281,7 @@ impl App {
                         }
                     }
                     if ui.button("Loop…").on_hover_text("A reviewer that checks each turn and tells the agent what to do next").clicked() {
-                        open_dialog = Some(Dialog::Loop { id: id.clone(), review: String::new() });
+                        open_dialog = Some(Dialog::Loop { id: id.clone(), review: String::new(), time: String::new() });
                     }
                     if tab.working() {
                         ui.spinner();
@@ -1131,7 +1300,13 @@ impl App {
                         ui.vertical_centered(|ui| ui.label(RichText::new(if tab.session().is_empty() { "A new chat. Type below to start." } else { "…" }).weak()));
                     }
                     for (i, m) in tab.messages.iter().enumerate() {
-                        ui.push_id(i, |ui| message(ui, m));
+                        ui.push_id(i, |ui| message(ui, m, &tab.live));
+                    }
+                    // A reply streaming before its message is stored.
+                    for ((mid, _), (reasoning, body)) in &tab.live {
+                        if !tab.messages.iter().any(|m| m["id"] == mid.as_str()) {
+                            live_part(ui, *reasoning, body);
+                        }
                     }
                     if to_bottom {
                         ui.scroll_to_cursor(Some(Align::BOTTOM));
@@ -1198,10 +1373,11 @@ impl App {
                                 .frame(egui::Frame::NONE)
                                 .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)),
                         );
+                        edit_menu(&edit, &mut tab.composer, false);
                         let mut send = edit.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                         ui.horizontal(|ui| {
                             if round_button(ui, Icon::Plus, true).on_hover_text("Attach files. You can also drop files on the window.").clicked() {
-                                open_dialog = Some(attach_dialog(&id, tab.client.host_dir().to_path_buf()));
+                                pick(&tx, &ctx, &id, "Attach files", false);
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if working && !ready {
@@ -1268,6 +1444,7 @@ impl App {
             Dialog::Rename { id, name } => {
                 window("Rename project").open(&mut open).show(ctx, |ui| {
                     let r = ui.add(TextEdit::singleline(name).desired_width(280.0));
+                    edit_menu(&r, name, false);
                     r.request_focus();
                     let enter = ui.input(|i| i.key_pressed(Key::Enter));
                     if (ui.button("Rename").clicked() || enter) && !name.trim().is_empty() {
@@ -1282,7 +1459,8 @@ impl App {
                     ui.set_max_width(360.0);
                     ui.label(format!("This permanently deletes \"{name}\": its encrypted files, chats and settings. It cannot be undone."));
                     ui.label("Type the project's name to confirm:");
-                    ui.add(TextEdit::singleline(typed).desired_width(280.0));
+                    let field = ui.add(TextEdit::singleline(typed).desired_width(280.0));
+                    edit_menu(&field, typed, false);
                     if ui.add_enabled(typed == name, egui::Button::new(RichText::new("Delete forever").color(ui.visuals().error_fg_color))).clicked() {
                         let target = id.clone();
                         self.run(id, move |m| m.delete(&target).map(|()| "Project deleted.".to_string()));
@@ -1294,7 +1472,13 @@ impl App {
                 window("Export decrypted files").open(&mut open).show(ctx, |ui| {
                     ui.set_max_width(420.0);
                     ui.label("Writes this project's files, unencrypted, to a folder outside AnonCode. Use an absolute path or ~/…");
-                    ui.add(TextEdit::singleline(dir).desired_width(400.0));
+                    ui.horizontal(|ui| {
+                        let field = ui.add(TextEdit::singleline(dir).desired_width(320.0));
+                        edit_menu(&field, dir, false);
+                        if ui.button("Choose…").clicked() {
+                            pick(&self.tx, &self.ctx, id, "Export to this folder", true);
+                        }
+                    });
                     if ui.button("Export").clicked() {
                         let (target, to) = (id.clone(), dir.clone());
                         self.run(id, move |m| m.export(&target, &to).map(|n| format!("Exported {n} files to {to}.")));
@@ -1306,7 +1490,13 @@ impl App {
                 window("Import a folder").open(&mut open).show(ctx, |ui| {
                     ui.set_max_width(420.0);
                     ui.label("Copies a folder's files into this project. Files with the same path are replaced. Use an absolute path or ~/…");
-                    ui.add(TextEdit::singleline(dir).desired_width(400.0));
+                    ui.horizontal(|ui| {
+                        let field = ui.add(TextEdit::singleline(dir).desired_width(320.0));
+                        edit_menu(&field, dir, false);
+                        if ui.button("Choose…").clicked() {
+                            pick(&self.tx, &self.ctx, id, "Import this folder", true);
+                        }
+                    });
                     if ui.button("Import").clicked() {
                         let (target, from) = (id.clone(), dir.clone());
                         self.run(id, move |m| m.import(&target, &from).map(|n| format!("Imported {n} files.")));
@@ -1330,6 +1520,7 @@ impl App {
                             go = std::env::var_os("HOME").map(PathBuf::from);
                         }
                         let field = ui.add(TextEdit::singleline(typed).hint_text("Folder or file path").desired_width(f32::INFINITY));
+                        edit_menu(&field, typed, false);
                         if field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                             let home = std::env::var("HOME").unwrap_or_default();
                             go = Some(PathBuf::from(typed.trim().replacen('~', &home, usize::from(typed.trim().starts_with('~')))));
@@ -1372,26 +1563,43 @@ impl App {
                     }
                 });
             }
-            Dialog::Loop { id, review } => {
+            Dialog::Loop { id, review, time } => {
                 let Some(tab) = self.tabs.get(id) else { return };
                 let session = tab.session();
                 window("Reviewer loop").open(&mut open).show(ctx, |ui| {
                     ui.set_width(440.0);
                     ui.label(RichText::new("After every turn a reviewer checks the work against your request and tells the agent the next step, until it is done or needs you. Everything it says appears in the chat as an ordinary message.").weak());
-                    ui.add(TextEdit::multiline(review).hint_text("What should the reviewer check? Leave empty for the default rules.").desired_rows(4).desired_width(f32::INFINITY));
-                    let send = |args: String| {
+                    let field = ui.add(TextEdit::multiline(review).hint_text("What should the reviewer check? Leave empty for the default rules.").desired_rows(4).desired_width(f32::INFINITY));
+                    edit_menu(&field, review, false);
+                    ui.horizontal(|ui| {
+                        ui.label("Stop after");
+                        let field = ui.add(TextEdit::singleline(time).hint_text("no limit").desired_width(110.0));
+                        edit_menu(&field, time, false);
+                        ui.label(RichText::new("e.g. 30m, 2h, 1h30m, 5 hours").weak());
+                    });
+                    let limit = time.trim().to_string();
+                    let send = |args: Vec<String>| {
                         let (client, session) = (tab.client.clone(), session.clone());
-                        request(&self.tx, &self.ctx, id, move || client.command(&session, "loop", &args));
+                        // In order: the time limit is set on the loop the first command started.
+                        request(&self.tx, &self.ctx, id, move || args.iter().try_for_each(|a| client.command(&session, "loop", a)));
                     };
                     ui.add_enabled_ui(!session.is_empty(), |ui| {
                         ui.horizontal(|ui| {
                             if ui.button("Start").clicked() {
-                                send(format!("start {}", review.trim()));
+                                let mut args = vec![format!("start {}", review.trim())];
+                                if !limit.is_empty() {
+                                    args.push(format!("time {limit}"));
+                                }
+                                send(args);
+                                keep = false;
+                            }
+                            if ui.add_enabled(!limit.is_empty(), egui::Button::new("Set time")).on_hover_text("Change the running loop's time limit, counted from now").clicked() {
+                                send(vec![format!("time {limit}")]);
                                 keep = false;
                             }
                             for (label, word) in [("Pause", "pause"), ("Resume", "resume"), ("Clear", "clear"), ("Status", "")] {
                                 if ui.button(label).clicked() {
-                                    send(word.to_string());
+                                    send(vec![word.to_string()]);
                                     keep = false;
                                 }
                             }
@@ -1455,7 +1663,7 @@ fn round_button(ui: &mut Ui, icon: Icon, enabled: bool) -> egui::Response {
 
 /// One entry of a chat. Every kind of entry is drawn: nothing the model
 /// was sent is hidden.
-fn message(ui: &mut Ui, m: &Value) {
+fn message(ui: &mut Ui, m: &Value, live: &BTreeMap<(String, u64), (bool, String)>) {
     let weak = ui.visuals().weak_text_color();
     match m["type"].as_str().unwrap_or("") {
         "user" => {
@@ -1471,20 +1679,37 @@ fn message(ui: &mut Ui, m: &Value) {
             });
         }
         "assistant" => {
-            for (i, part) in m["content"].as_array().into_iter().flatten().enumerate() {
+            let mid = text(m, "id");
+            let content = m["content"].as_array().map(Vec::as_slice).unwrap_or_default();
+            for (i, part) in content.iter().enumerate() {
+                let streamed = live.get(&(mid.clone(), i as u64)).filter(|_| part["text"].as_str().is_none_or(str::is_empty));
+                if let Some((reasoning, body)) = streamed {
+                    live_part(ui, *reasoning, body);
+                    continue;
+                }
                 match part["type"].as_str().unwrap_or("") {
-                    "text" => prose(ui, part["text"].as_str().unwrap_or("")),
+                    "text" => {
+                        let raw = part["text"].as_str().unwrap_or("");
+                        let shown = crate::tidy::tidy(raw);
+                        prose(ui, &shown);
+                        if shown.trim().is_empty() && !raw.trim().is_empty() {
+                            ui.label(RichText::new("(The model wrote a tool call as text instead of making it. It did not run.)").weak().small());
+                        }
+                    }
                     "reasoning" => {
                         let body = part["text"].as_str().unwrap_or("");
                         if !body.trim().is_empty() {
                             egui::CollapsingHeader::new(RichText::new("Thinking").weak().small()).id_salt(("think", i)).show(ui, |ui| {
-                                ui.label(RichText::new(body).weak());
+                                copy_menu(ui.label(RichText::new(body).weak()), body);
                             });
                         }
                     }
                     "tool" => tool(ui, i, part),
                     _ => {}
                 }
+            }
+            for ((_, _), (reasoning, body)) in live.range((mid.clone(), content.len() as u64)..).take_while(|((id, _), _)| *id == mid) {
+                live_part(ui, *reasoning, body);
             }
             if let Some(error) = m["error"]["message"].as_str().or(m["error"]["name"].as_str()) {
                 ui.colored_label(ui.visuals().error_fg_color, format!("The model request failed: {error}"));
@@ -1493,12 +1718,14 @@ fn message(ui: &mut Ui, m: &Value) {
         "synthetic" | "system" | "skill" => {
             let label = m["description"].as_str().filter(|d| !d.is_empty()).unwrap_or(if m["type"] == "system" { "System note" } else { "Automatic message" });
             egui::CollapsingHeader::new(RichText::new(label).weak().small()).id_salt("note").show(ui, |ui| {
-                ui.label(RichText::new(m["text"].as_str().unwrap_or("")).weak());
+                let body = m["text"].as_str().unwrap_or("");
+                copy_menu(ui.label(RichText::new(body).weak()), body);
             });
         }
         "shell" => {
             egui::CollapsingHeader::new(RichText::new(format!("$ {}", clip(m["command"].as_str().unwrap_or(""), 90))).monospace().small()).id_salt("shell").show(ui, |ui| {
-                ui.label(RichText::new(clip(m["output"]["output"].as_str().unwrap_or(""), 6000)).monospace().small());
+                let output = m["output"]["output"].as_str().unwrap_or("");
+                copy_menu(ui.label(RichText::new(clip(output, 6000)).monospace().small()), output);
             });
         }
         "model-switched" => {
@@ -1527,6 +1754,257 @@ fn message(ui: &mut Ui, m: &Value) {
     ui.add_space(4.0);
 }
 
+/// The right-click menu on selected chat text.
+///
+/// In egui any press on a label starts a new selection, the right button
+/// too, so a right-click would wipe out what was selected. This sees the
+/// window's input before egui does: a right-click inside the selected chat
+/// text opens this menu instead, and a click on one of its items is taken
+/// here too, so the selection stays as it was.
+#[derive(Default)]
+struct Selected {
+    /// The selected text, as egui last reported it.
+    last: String,
+    /// Chat text drawn last frame: where, and all of it.
+    labels: Vec<(egui::Rect, String)>,
+    menu: Option<CopyMenu>,
+    /// Text to put on the clipboard this frame.
+    copy: Option<String>,
+    /// The release of a press this took.
+    swallow: Option<egui::PointerButton>,
+    /// Ctrl+A outside a text box: the whole chat is selected.
+    all: bool,
+}
+
+impl Selected {
+    fn all_text(&self) -> String {
+        self.labels.iter().map(|(_, t)| t.trim()).filter(|t| !t.is_empty()).collect::<Vec<_>>().join("\n\n")
+    }
+}
+
+#[derive(Clone)]
+struct CopyMenu {
+    at: egui::Pos2,
+    selected: String,
+    whole: String,
+    /// Where its two items were drawn: copy the selection, copy all.
+    items: [egui::Rect; 2],
+}
+
+impl egui::plugin::Plugin for Selected {
+    fn debug_name(&self) -> &'static str {
+        "anoncode copy menu"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        use egui::{Event, PointerButton};
+        let selected = self.all || (!self.last.is_empty() && ctx.with_plugin(|l: &mut egui::text_selection::LabelSelectionState| l.has_selection()).unwrap_or(false));
+        let in_text_box = ctx.memory(|m| m.focused().is_some());
+        let mut keep = Vec::with_capacity(input.events.len());
+        for event in std::mem::take(&mut input.events) {
+            match &event {
+                Event::PointerButton { button, pressed: false, .. } if self.swallow == Some(*button) => {
+                    self.swallow = None;
+                    continue;
+                }
+                Event::Key { key: egui::Key::A, pressed: true, modifiers, .. } if (modifiers.ctrl || modifiers.command) && !in_text_box && !self.labels.is_empty() => {
+                    self.all = true;
+                    ctx.with_plugin(|l: &mut egui::text_selection::LabelSelectionState| l.clear_selection());
+                    ctx.request_repaint();
+                    continue;
+                }
+                Event::Copy | Event::Cut if self.all && !in_text_box => {
+                    self.copy = Some(self.all_text());
+                    continue;
+                }
+                Event::PointerButton { pos, button: PointerButton::Secondary, pressed: true, .. } if selected => {
+                    if let Some((_, whole)) = self.labels.iter().find(|(r, _)| r.contains(*pos)) {
+                        let chosen = if self.all { self.all_text() } else { self.last.clone() };
+                        self.menu = Some(CopyMenu { at: *pos, selected: chosen, whole: whole.clone(), items: [egui::Rect::NOTHING; 2] });
+                        self.swallow = Some(PointerButton::Secondary);
+                        continue;
+                    }
+                }
+                Event::PointerButton { pos, button: PointerButton::Primary, pressed: true, .. } if self.menu.is_some() => {
+                    let menu = self.menu.take().unwrap();
+                    if let Some(i) = menu.items.iter().position(|r| r.contains(*pos)) {
+                        self.copy = Some(if i == 0 { menu.selected } else { menu.whole });
+                        self.swallow = Some(PointerButton::Primary);
+                        continue;
+                    }
+                    self.all = false;
+                }
+                Event::PointerButton { pressed: true, button: PointerButton::Primary, .. } | Event::Text(_) => self.all = false,
+                Event::Key { key: egui::Key::Escape, pressed: true, .. } => {
+                    self.menu = None;
+                    self.all = false;
+                }
+                Event::MouseWheel { .. } => self.menu = None,
+                _ => {}
+            }
+            keep.push(event);
+        }
+        input.events = keep;
+    }
+
+    fn on_begin_pass(&mut self, _ui: &mut Ui) {
+        self.labels.clear();
+    }
+
+    /// The whole chat, when selected, is shown as selected.
+    fn on_end_pass(&mut self, ui: &mut Ui) {
+        if !self.all {
+            return;
+        }
+        let color = ui.visuals().selection.bg_fill.gamma_multiply(0.45);
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::unique("anoncode-select-all")));
+        for (rect, _) in self.labels.iter().filter(|(r, _)| r.is_positive()) {
+            painter.rect_filled(*rect, 2.0, color);
+        }
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        for command in &output.platform_output.commands {
+            if let egui::OutputCommand::TextSelectionSettled(text) = command {
+                self.last = text.clone();
+            }
+        }
+    }
+}
+
+/// Draws the copy menu, if open, and copies what it was asked to.
+fn selected_menu(ctx: &egui::Context) {
+    let (menu, copy) = ctx.with_plugin(|s: &mut Selected| (s.menu.clone(), s.copy.take())).unwrap_or_default();
+    if let Some(text) = copy {
+        ctx.copy_text(text);
+    }
+    let Some(menu) = menu else { return };
+    let items = egui::Area::new(egui::Id::unique("anoncode-copy-menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(menu.at)
+        .show(ctx, |ui| {
+            egui::Frame::menu(ui.style())
+                .show(ui, |ui| {
+                    ui.set_min_width(150.0);
+                    let copy = ui.add(egui::Button::new("Copy").shortcut_text("Ctrl+C").frame(false)).rect;
+                    let all = ui.add(egui::Button::new("Copy all of this").frame(false)).rect;
+                    [copy, all]
+                })
+                .inner
+        })
+        .inner;
+    ctx.with_plugin(|s: &mut Selected| {
+        if let Some(m) = &mut s.menu {
+            m.items = items;
+        }
+    });
+}
+
+/// Chat text: drag to select, then Ctrl+C or right-click to copy. Without
+/// a selection the right-click menu copies all of it.
+fn copy_menu(response: egui::Response, whole: &str) {
+    // The visible part only: what scrolled out of view is clipped away.
+    let rect = response.interact_rect;
+    response.ctx.with_plugin(|s: &mut Selected| s.labels.push((rect, whole.to_string())));
+    response.context_menu(|ui| {
+        if ui.button("Copy all of this").clicked() {
+            ui.ctx().copy_text(whole.to_string());
+            ui.close();
+        }
+    });
+}
+
+/// The right-click menu on a text box: cut, copy, paste and select all,
+/// as Ctrl+X, Ctrl+C, Ctrl+V and Ctrl+A do. A password can only be pasted
+/// and selected.
+fn edit_menu(response: &egui::Response, text: &mut String, password: bool) {
+    use egui::text::{CCursor, CCursorRange};
+    let ctx = response.ctx.clone();
+    let id = response.id;
+    // The right button's press moves the cursor and drops the selection,
+    // as any press does; the selection from before it is put back.
+    let before = id.with("before right-click");
+    let right = ctx.input(|i| i.pointer.button_down(egui::PointerButton::Secondary) || i.pointer.button_released(egui::PointerButton::Secondary));
+    if ctx.memory(|m| m.has_focus(id)) && ctrl_a(&ctx) {
+        select_all(&ctx, id, text);
+    }
+    if let Some(mut state) = egui::text_edit::TextEditState::load(&ctx, id) {
+        if response.secondary_clicked() {
+            if let Some(range) = ctx.data(|d| d.get_temp::<CCursorRange>(before)) {
+                state.cursor.set_char_range(Some(range));
+                state.store(&ctx, id);
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        } else if !right && ctx.memory(|m| m.has_focus(id)) {
+            // Only while focused: pressing a menu item takes the focus, and
+            // with it the selection, before the item acts.
+            if let Some(range) = state.cursor.char_range() {
+                ctx.data_mut(|d| d.insert_temp(before, range));
+            }
+        }
+    }
+    response.context_menu(|ui| {
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap_or_default();
+        let range = ctx.data(|d| d.get_temp::<CCursorRange>(before)).or(state.cursor.char_range());
+        let [a, b] = range.map_or([CCursor::new(0); 2], |r| r.sorted_cursors()).map(|c| c.index.0.min(text.chars().count()));
+        let byte = |c: usize| text.char_indices().nth(c).map_or(text.len(), |(i, _)| i);
+        let (start, end) = (byte(a), byte(b));
+        let has = start < end && !password;
+        let place = |state: &mut egui::text_edit::TextEditState, from: usize, to: usize| {
+            state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(from), CCursor::new(to))));
+            ctx.memory_mut(|m| m.request_focus(id));
+        };
+        if ui.add_enabled(has, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+            ctx.copy_text(text[start..end].to_string());
+            text.replace_range(start..end, "");
+            place(&mut state, a, a);
+            ui.close();
+        }
+        if ui.add_enabled(has, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+            ctx.copy_text(text[start..end].to_string());
+            place(&mut state, a, b);
+            ui.close();
+        }
+        if ui.add(egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+            if let Some(pasted) = arboard::Clipboard::new().and_then(|mut c| c.get_text()).ok().filter(|t| !t.is_empty()) {
+                text.replace_range(start..end, &pasted);
+                let at = a + pasted.chars().count();
+                place(&mut state, at, at);
+            }
+            ui.close();
+        }
+        if ui.add_enabled(!text.is_empty(), egui::Button::new("Select all").shortcut_text("Ctrl+A")).clicked() {
+            place(&mut state, 0, text.chars().count());
+            ui.close();
+        }
+        state.store(&ctx, id);
+    });
+}
+
+/// Ctrl+A was pressed this frame.
+fn ctrl_a(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::A, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command)))
+}
+
+/// Focuses a text box with all of its text selected.
+fn select_all(ctx: &egui::Context, id: egui::Id, text: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()))));
+    state.store(ctx, id);
+    ctx.data_mut(|d| d.insert_temp(id.with("before right-click"), CCursorRange::two(CCursor::new(0), CCursor::new(text.chars().count()))));
+    ctx.memory_mut(|m| m.request_focus(id));
+}
+
+/// Part of a reply as it is being written.
+fn live_part(ui: &mut Ui, reasoning: bool, body: &str) {
+    if reasoning {
+        ui.label(RichText::new(clip(body.trim(), 600)).weak().italics());
+        return;
+    }
+    prose(ui, &crate::tidy::tidy(body));
+}
+
 fn tool(ui: &mut Ui, index: usize, part: &Value) {
     let state = &part["state"];
     let status = state["status"].as_str().unwrap_or("");
@@ -1541,11 +2019,12 @@ fn tool(ui: &mut Ui, index: usize, part: &Value) {
     let title = format!("{} {}  ({mark})", text(part, "name"), clip(hint, 80));
     let color = if status == "error" { ui.visuals().error_fg_color } else { ui.visuals().weak_text_color() };
     egui::CollapsingHeader::new(RichText::new(title).monospace().small().color(color)).id_salt(("tool", index)).show(ui, |ui| {
-        ui.label(RichText::new(clip(&serde_json::to_string_pretty(input).unwrap_or_default(), 4000)).monospace().small());
+        let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
+        copy_menu(ui.label(RichText::new(clip(&pretty, 4000)).monospace().small()), &pretty);
         let output: String = state["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
         if !output.is_empty() {
             ui.separator();
-            ui.label(RichText::new(clip(&output, 6000)).monospace().small());
+            copy_menu(ui.label(RichText::new(clip(&output, 6000)).monospace().small()), &output);
         }
         if let Some(error) = state["error"]["message"].as_str() {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1562,10 +2041,10 @@ fn prose(ui: &mut Ui, body: &str) {
             let code = chunk.split_once('\n').map(|(_, rest)| rest).unwrap_or(chunk).trim_end();
             egui::Frame::group(ui.style()).fill(ui.visuals().extreme_bg_color).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add(egui::Label::new(RichText::new(code).monospace()).selectable(true));
+                copy_menu(ui.add(egui::Label::new(RichText::new(code).monospace()).selectable(true)), code);
             });
         } else if !chunk.trim().is_empty() {
-            ui.add(egui::Label::new(inline(ui, chunk.trim_matches('\n'))).wrap().selectable(true));
+            copy_menu(ui.add(egui::Label::new(inline(ui, chunk.trim_matches('\n'))).wrap().selectable(true)), body);
         }
     }
 }
@@ -1619,7 +2098,14 @@ fn inline(ui: &Ui, body: &str) -> egui::text::LayoutJob {
 }
 
 impl eframe::App for App {
+    /// The self-test script's mouse and keyboard, fed in as if real.
+    #[cfg(feature = "selftest")]
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        raw_input.events.append(&mut self.script.events);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        selected_menu(ui.ctx());
         if QUIT.load(Ordering::SeqCst) {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
@@ -1718,6 +2204,8 @@ mod selftest {
     use std::time::Instant;
 
     pub struct Script {
+        /// Input events for the next frame.
+        pub events: Vec<egui::Event>,
         steps: Vec<String>,
         at: usize,
         started: bool,
@@ -1727,7 +2215,7 @@ mod selftest {
     impl Script {
         pub fn from_env() -> Script {
             let steps = std::env::var("ANONCODE_SELFTEST").unwrap_or_default().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-            Script { steps, at: 0, started: false, since: Instant::now() }
+            Script { events: Vec::new(), steps, at: 0, started: false, since: Instant::now() }
         }
     }
 
@@ -1766,13 +2254,17 @@ mod selftest {
                 true
             }
             "set" => {
-                // set webfetch off|ask|allow, set sandbox on|off, set approvals auto|ask, set focus on|off, set reopen
+                // set webfetch off|ask|allow, set sandbox on|off, set approvals auto|ask, set focus on|off,
+                // set draft model|quick, set rollouts N, set cache on|off, set reopen
                 let (what, value) = rest.split_once(' ').unwrap_or((rest, ""));
                 match (what, value) {
                     ("webfetch", v) => app.settings.web_fetch = match v { "ask" => Access::Ask, "allow" => Access::Allow, _ => Access::Off },
                     ("sandbox", v) => app.settings.sandbox = v == "on",
                     ("approvals", v) => app.settings.approvals = if v == "ask" { Approvals::Ask } else { Approvals::Auto },
                     ("focus", v) => app.settings.focus = v == "on",
+                    ("draft", v) => app.settings.focus_draft = if v == "quick" { FocusDraft::Quick } else { FocusDraft::Model },
+                    ("rollouts", v) => app.settings.focus_rollouts = v.parse().unwrap_or(3),
+                    ("cache", v) => app.settings.tool_cache = v == "on",
                     ("reopen", _) => app.reopen_all(),
                     _ => {}
                 }
@@ -1796,6 +2288,80 @@ mod selftest {
             }
             "settings" => {
                 app.show_settings = true;
+                true
+            }
+            // mouse move|down|up|rdown|rup|click|rclick X Y, in points.
+            "mouse" => {
+                let mut it = rest.split_whitespace();
+                let (what, x, y) = (it.next().unwrap_or(""), it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0), it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0));
+                let pos = egui::pos2(x, y);
+                let button = |pressed, button| egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE };
+                app.script.events.push(egui::Event::PointerMoved(pos));
+                match what {
+                    "down" => app.script.events.push(button(true, egui::PointerButton::Primary)),
+                    "up" => app.script.events.push(button(false, egui::PointerButton::Primary)),
+                    "rdown" => app.script.events.push(button(true, egui::PointerButton::Secondary)),
+                    "rup" => app.script.events.push(button(false, egui::PointerButton::Secondary)),
+                    _ => {}
+                }
+                true
+            }
+            // key ctrl+a | ctrl+c | ctrl+v | ctrl+x | enter ...: as the window would get it.
+            "key" => {
+                let (ctrl, name) = rest.strip_prefix("ctrl+").map_or((false, rest), |k| (true, k));
+                let modifiers = if ctrl { egui::Modifiers::COMMAND } else { egui::Modifiers::NONE };
+                match (ctrl, name) {
+                    (true, "c") => app.script.events.push(egui::Event::Copy),
+                    (true, "x") => app.script.events.push(egui::Event::Cut),
+                    // The window reads the clipboard itself on Ctrl+V.
+                    (true, "v") => app.script.events.push(egui::Event::Paste(arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default())),
+                    _ => {
+                        if let Some(key) = egui::Key::from_name(&name.to_uppercase()).or_else(|| egui::Key::from_name(name)) {
+                            for pressed in [true, false] {
+                                app.script.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers });
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            // Prints the clipboard and the message box, to check copying and pasting.
+            "show" => {
+                let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                eprintln!("selftest: clipboard: {clip:?}");
+                eprintln!("selftest: message box: {:?}", app.tabs.get(&id).map(|t| t.composer.clone()).unwrap_or_default());
+                eprintln!("selftest: attachments: {:?}", app.tabs.get(&id).map(|t| t.attachments.clone()).unwrap_or_default());
+                eprintln!("selftest: scale {} pointer {:?} screen {:?}", ctx.pixels_per_point(), ctx.input(|i| i.pointer.latest_pos()), ctx.content_rect());
+                true
+            }
+            // Saves the window's own frame as a PPM picture: nothing else on the screen is in it.
+            "snap" => {
+                let path = PathBuf::from(rest);
+                ctx.request_screenshot(move |image| {
+                    let mut out = format!("P6\n{} {}\n255\n", image.size[0], image.size[1]).into_bytes();
+                    out.extend(image.pixels.iter().flat_map(|p| [p.r(), p.g(), p.b()]));
+                    let _ = std::fs::write(&path, out);
+                });
+                ctx.request_repaint();
+                true
+            }
+            // Waits for this file, then runs its lines next (it is removed).
+            "more" => match std::fs::read_to_string(rest) {
+                Ok(more) => {
+                    let _ = std::fs::remove_file(rest);
+                    let at = app.script.at + 1;
+                    let lines: Vec<String> = more.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                    app.script.steps.splice(at..at, lines);
+                    true
+                }
+                Err(_) => false,
+            },
+            "clipboard" => {
+                let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(rest.to_string()));
+                true
+            }
+            "type" => {
+                app.script.events.push(egui::Event::Text(rest.to_string()));
                 true
             }
             "noprovider" => {

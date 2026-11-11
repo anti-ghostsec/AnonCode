@@ -22,6 +22,7 @@ pub mod projects;
 pub mod runspace;
 pub mod store;
 pub mod supervisor;
+pub mod tidy;
 pub mod vault;
 
 use std::fmt;

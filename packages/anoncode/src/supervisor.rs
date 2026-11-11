@@ -74,6 +74,9 @@ const SYSTEM: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "
 /// crash is sealed back in only if it was AnonCode's own.
 const MARK_WORK: &str = "work-out";
 const MARK_HOME: &str = "home-out";
+const MARK_CACHE: &str = "cache-out";
+/// Where the build caches are, inside the sandbox.
+const SANDBOX_CACHE: &str = "/cache";
 
 /// Settings shared by every project, sealed in the app's vault.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -96,6 +99,13 @@ pub struct Settings {
     pub focus: bool,
     /// When FOCUS starts, as a percentage of the model's context window.
     pub focus_share: u8,
+    /// How FOCUS decides what to leave out.
+    pub focus_draft: FocusDraft,
+    /// How many plans the model drafts when FOCUS asks it (1 to 5).
+    pub focus_rollouts: u8,
+    /// Keep each project's build caches (cargo registry, npm, bun, pip,
+    /// downloaded tools) on disk and sealed, instead of starting empty in RAM.
+    pub tool_cache: bool,
     /// Lock AnonCode after this many minutes with no input (0: never).
     pub auto_lock_minutes: u32,
 }
@@ -111,6 +121,9 @@ impl Default for Settings {
             approvals: Approvals::Auto,
             focus: true,
             focus_share: 60,
+            focus_draft: FocusDraft::Model,
+            focus_rollouts: 3,
+            tool_cache: true,
             auto_lock_minutes: 0,
         }
     }
@@ -119,9 +132,23 @@ impl Default for Settings {
 impl Settings {
     /// What an agent is started with: changing these takes effect when a
     /// project is opened (or reopened).
-    pub fn agent_part(&self) -> (bool, Access, Approvals, bool, u8) {
-        (self.sandbox, self.web_fetch, self.approvals, self.focus, self.focus_share)
+    pub fn agent_part(&self) -> AgentPart {
+        (self.sandbox, self.web_fetch, self.approvals, self.focus, self.focus_share, self.focus_draft, self.focus_rollouts, self.tool_cache)
     }
+}
+
+pub type AgentPart = (bool, Access, Approvals, bool, u8, FocusDraft, u8, bool);
+
+/// FOCUS's draft model, as in the first AnonCode's `focusDraft` option.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FocusDraft {
+    /// The paper's method: the chat's model drafts plans that cite the
+    /// parts they need, then reviews what would be left out. Costs a few
+    /// extra model calls each time FOCUS compresses.
+    Model,
+    /// An offline guess from word overlap, recency and errors. No calls.
+    Quick,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -347,6 +374,17 @@ impl Manager {
             runspace::materialize(&state, &paths.home)?;
             store.put_with("meta", MARK_HOME, b"1", true)?;
         }
+        if self.settings().unwrap_or_default().tool_cache {
+            let mut cache = Efs::open(store.clone(), "cache")?;
+            if store.has("meta", MARK_CACHE) && paths.cache.is_dir() {
+                runspace::sync_back_skipping(&mut cache, &paths.cache, &[])?;
+            } else {
+                runspace::wipe(&paths.cache)?;
+                runspace::materialize(&cache, &paths.cache)?;
+                store.put_with("meta", MARK_CACHE, b"1", true)?;
+            }
+            create_private_dir(&paths.cache)?;
+        }
         create_private_dir(&paths.work)?;
         create_private_dir(&paths.home)?;
         let (child, port, password, sandboxed) = self.spawn_server(&paths)?;
@@ -395,7 +433,7 @@ impl Manager {
             }
         }
         path.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
-        let plugins: Vec<String> = ["loop", "focus", "privacy"]
+        let plugins: Vec<String> = ["loop", "focus", "privacy", "tidy"]
             .iter()
             .filter(|p| self.cfg.root.join("packages/anoncode-plugins").join(p).is_dir())
             .map(|p| code.join("packages/anoncode-plugins").join(p).to_string_lossy().into_owned())
@@ -438,10 +476,6 @@ impl Manager {
             ("XDG_DATA_HOME".into(), home.join("data").to_string_lossy().into_owned()),
             ("XDG_CONFIG_HOME".into(), home.join("config").to_string_lossy().into_owned()),
             ("XDG_STATE_HOME".into(), home.join("state").to_string_lossy().into_owned()),
-            // Caches (compiled code, downloaded tools) live and die with the
-            // agent's data in RAM; they are not sealed.
-            ("XDG_CACHE_HOME".into(), home.join("cache").to_string_lossy().into_owned()),
-            ("CARGO_HOME".into(), home.join(".cargo").to_string_lossy().into_owned()),
             ("TMPDIR".into(), if sandboxed { "/tmp".into() } else { paths.scratch.join("tmp").to_string_lossy().into_owned() }),
             ("OPENCODE_PASSWORD".into(), password.clone()),
             ("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into()),
@@ -452,11 +486,31 @@ impl Manager {
             ("ANONCODE_WORK".into(), work.to_string_lossy().into_owned()),
             ("ANONCODE_BIN".into(), bin.to_string_lossy().into_owned()),
         ];
+        // Build caches: on disk and sealed with the project when kept,
+        // otherwise in RAM with the agent's data and gone when it locks.
+        let cache_dir = match (settings.tool_cache, sandboxed) {
+            (true, true) => PathBuf::from(SANDBOX_CACHE),
+            (true, false) => paths.cache.clone(),
+            (false, _) => home.clone(),
+        };
+        let sub = |name: &str| cache_dir.join(name).to_string_lossy().into_owned();
+        let (xdg, cargo) = if settings.tool_cache { ("xdg", "cargo") } else { ("cache", ".cargo") };
+        env.push(("XDG_CACHE_HOME".into(), sub(xdg)));
+        env.push(("CARGO_HOME".into(), sub(cargo)));
+        if settings.tool_cache {
+            env.push(("npm_config_cache".into(), sub("npm")));
+            env.push(("BUN_INSTALL_CACHE_DIR".into(), sub("bun")));
+            env.push(("GOMODCACHE".into(), sub("go/mod")));
+            env.push(("GOCACHE".into(), sub("go/build")));
+            env.push(("PIP_CACHE_DIR".into(), sub("pip")));
+        }
         if tools.contains(&".rustup") {
             env.push(("RUSTUP_HOME".into(), if sandboxed { format!("{SANDBOX_TOOLS}/.rustup") } else { home_dir.join(".rustup").to_string_lossy().into_owned() }));
         }
         env.push(("ANONCODE_FOCUS".into(), if settings.focus { "on".into() } else { "off".into() }));
         env.push(("ANONCODE_FOCUS_SHARE".into(), settings.focus_share.clamp(20, 95).to_string()));
+        env.push(("ANONCODE_FOCUS_DRAFT".into(), if settings.focus_draft == FocusDraft::Model { "model".into() } else { "quick".into() }));
+        env.push(("ANONCODE_FOCUS_ROLLOUTS".into(), settings.focus_rollouts.clamp(1, 5).to_string()));
         if let Ok(budget) = std::env::var("ANONCODE_FOCUS_BUDGET") {
             env.push(("ANONCODE_FOCUS_BUDGET".into(), budget));
         }
@@ -519,6 +573,10 @@ impl Manager {
             let (h, w) = (paths.home.to_string_lossy().into_owned(), paths.work.to_string_lossy().into_owned());
             // bun finds its preload modules from the folder it starts in, so
             // the server starts in its own package; the agent works in /work.
+            if settings.tool_cache {
+                let c = paths.cache.to_string_lossy().into_owned();
+                add(&["--bind", &c, SANDBOX_CACHE]);
+            }
             add(&["--bind", &h, SANDBOX_HOME, "--bind", &w, SANDBOX_WORK, "--chdir", &format!("{SANDBOX_CODE}/packages/cli")]);
             // No --die-with-parent: it fires when the thread that started the
             // sandbox ends, not the app. Locking stops the server, and one left
@@ -579,9 +637,13 @@ impl Manager {
         let paths = self.projects.paths(id)?;
         let store = self.store(&open.vault, &paths)?;
         let mut project = Efs::open(store.clone(), "project")?;
-        let mut state = Efs::open(store, "state")?;
+        let mut state = Efs::open(store.clone(), "state")?;
         let p = runspace::sync_back(&mut project, &paths.work)?;
         let s = runspace::sync_back_skipping(&mut state, &paths.home, HOME_SKIP)?;
+        if store.has("meta", MARK_CACHE) && paths.cache.is_dir() {
+            let mut cache = Efs::open(store, "cache")?;
+            runspace::sync_back_skipping(&mut cache, &paths.cache, &[])?;
+        }
         let mut skipped = p.skipped;
         skipped.extend(s.skipped.into_iter().map(|x| format!("(agent data) {x}")));
         Ok(Sealed { changed: p.changed.len(), deleted: p.deleted.len(), skipped })
@@ -599,6 +661,7 @@ impl Manager {
             let store = self.store(&open.vault, &paths)?;
             store.remove("meta", MARK_WORK)?;
             store.remove("meta", MARK_HOME)?;
+            store.remove("meta", MARK_CACHE)?;
         }
         Ok(())
     }
