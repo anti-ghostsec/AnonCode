@@ -92,10 +92,20 @@ impl Efs {
     pub fn read(&self, path: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let p = norm_vpath(path)?;
         match self.manifest.get(&p) {
-            Some(e) if e.link.is_none() => match self.store.get(&self.collection, &self.blob_id(&p))? {
-                Some(data) => Ok(Some(data)),
-                None => self.store.get(&self.collection, &legacy_blob_id(&p)),
-            },
+            Some(e) if e.link.is_none() => {
+                let data = match self.store.get(&self.collection, &self.blob_id(&p))? {
+                    Some(data) => Some(data),
+                    None => self.store.get(&self.collection, &legacy_blob_id(&p))?,
+                };
+                // The manifest records each file's hash: an older copy of a
+                // file put back on its own is caught here.
+                if let (Some(data), Some(hash)) = (&data, &e.hash) {
+                    if sha256_hex(data) != *hash {
+                        return Err(Error::Damaged);
+                    }
+                }
+                Ok(data)
+            }
             _ => Ok(None),
         }
     }

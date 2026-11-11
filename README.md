@@ -6,9 +6,10 @@ unreadable without it.
 
 AnonCode is three things put together:
 
-- **The agent** is [opencode](https://github.com/anomalyco/opencode) (v2.2.7), unmodified. It
-  does the chat, the tools and the language servers. Its own readme is in
-  [README.opencode.md](README.opencode.md).
+- **The agent** is [opencode](https://github.com/anomalyco/opencode) (v2.2.7, upstream commit
+  `d4aeee5`). It does the chat, the tools and the language servers. Its source is unmodified;
+  the parts AnonCode doesn't run (the web and desktop apps, the website, cloud infrastructure,
+  release tooling) are removed. Its own readme is in [README.opencode.md](README.opencode.md).
 - **The app** (`packages/anoncode`, Rust) is the window you use and the vault underneath it.
   It is not a web page and has no browser in it.
 - **Two plugins** (`packages/anoncode-plugins`) add the reviewer loop and FOCUS context
@@ -24,7 +25,7 @@ AnonCode is three things put together:
 ```
 
 The first run builds the app and installs the agent's dependencies. You need
-[Rust](https://rustup.rs) and [Bun](https://bun.sh) 1.4.
+[Rust](https://rustup.rs), [Bun](https://bun.sh) 1.4 and bubblewrap (`apt install bubblewrap`).
 
 - **You log in once.** The first run asks you to choose a passphrase; after that it is asked
   for when the app starts, and nothing else is.
@@ -36,6 +37,14 @@ The first run builds the app and installs the agent's dependencies. You need
   AnonCode's own vault and given to every project. No models are available until you add one:
   opencode's hosted models, web search and sharing are switched off, and the model list is not
   fetched from the network. The model you pick becomes the default for other projects.
+- **Settings** also holds what the agent may do, for every project:
+  - run in the sandbox (on by default; turn off only if a tool can't work inside it),
+  - fetch web pages: off (default), ask each time, or allowed,
+  - run commands and change files without asking (default), or ask first,
+  - FOCUS on or off, and how full a chat gets before it starts,
+  - lock AnonCode after 5 to 60 idle minutes.
+
+  The agent settings apply when a project is opened; **Reopen them now** restarts the open ones.
 - **+** in the message box attaches files; you can also drop files on the window.
 - **Loop…** starts a reviewer that checks each turn against your request and tells the agent
   what to do next. Its messages appear in the chat like any other
@@ -47,25 +56,28 @@ The first run builds the app and installs the agent's dependencies. You need
 | | |
 | --- | --- |
 | Login | Your passphrase opens AnonCode's own vault, which holds the shared settings (provider keys, default model) and a random secret for each project. Each project's vault is locked to its secret, so projects stay separate vaults but need no passphrase of their own. |
-| Key | scrypt (64 MiB) over the passphrase (or a project's secret) and a random salt. The cost stored in a vault is checked against a minimum and a maximum before anything is derived. |
-| Encryption | AES-256-GCM, a fresh random nonce per record, tampering detected on open. |
+| Key | Argon2id (192 MiB, 3 passes) over the passphrase, and a random salt. A project's vault, locked to a random 256-bit secret, uses the lowest cost, since its secret can't be guessed. The cost stored in a vault is checked against a minimum and a maximum before anything is derived. Vaults from the first AnonCode (scrypt) still open. |
+| Encryption | AES-256-GCM, a fresh random nonce per record, tampering detected on open. Each record is bound to its name, so a record copied over another fails to open, and each file is checked against the hash in its project's sealed manifest, so an older copy put back is caught. |
 | Key at rest | Never written. Only the cost, the salt and a sealed check value are on disk. The key is wiped from memory on lock. |
 | Project files | One sealed record per file, listed by a sealed manifest. Record names are a keyed hash of the path, so a name can't be matched against a guessed path. |
-| Chats, keys, settings | The agent's database is sealed with the project. While unlocked it exists only in memory (`/dev/shm`), never on disk. |
+| Chats, keys, settings | The agent's database is sealed with the project. While unlocked it exists only in memory (`$XDG_RUNTIME_DIR`, or `/dev/shm`), never on disk; a memory folder is used only if it is owned by you and closed to everyone else. Caches (compiled code, downloaded tools) live there too and are thrown away on lock. |
+| Project list | Names and creation times are sealed in AnonCode's vault, not kept in a plaintext list. |
 | Working copy | Tools need real files, so while a project is unlocked its files are plaintext under `.anoncode/projects/<id>/run/work`. Locking seals what changed and wipes it. |
-| After a crash | The leftover working copy is sealed at the next unlock before anything else. |
+| After a crash | The leftover working copy is sealed at the next unlock before anything else, but only if a sealed marker says AnonCode wrote it out and its folder is still closed to everyone else. Otherwise it is thrown away. |
+| The agent | Runs in a bubblewrap sandbox with an empty environment, so no API key or setting from your shell reaches it. It sees the system folders and a few toolchains read-only (`~/.local/bin`, `~/.cargo/bin`, `~/.rustup`, `~/.bun/bin`, not `~/.cargo` as a whole, which holds registry credentials), the project at `/work`, its own data at `/home/agent`, and nothing else of your disk. Its user and machine are called `agent` and `anoncode`. Without bubblewrap AnonCode refuses to start an agent unless the sandbox is turned off in Settings. |
+| Network | Nothing goes to opencode's servers: its hosted models, web search, sharing, model-list download and updater are off. The agent may not fetch web pages unless Settings allows it. Requests to a model provider carry a plain user agent and none of the headers naming opencode. |
 | Recovery | None. A lost passphrase means everything is gone. |
 
 Everything AnonCode stores is under `.anoncode/` in this folder. Vaults made by the first
 AnonCode (same scrypt and AES-256-GCM format) still open, and a project that has its own
 passphrase is asked for it once, after which it opens with the others.
 
-**What it does not protect.** How many files a project has, roughly how big each is and when it
-last changed are visible on disk, as are project names. While a project is unlocked, anything
-running as you can read its working copy. A power cut loses chat history since the last lock or
-"Save to vault". The agent's plan folder (`~/.opencode/plan`) and its terminal sockets (`/tmp`)
-are outside the vault, and so is `.anoncode/cache`, which holds the agent's compiled code and
-downloaded tools, not your data.
+**What it does not protect.** How many files and projects there are, roughly how big each is
+and when each last changed are visible on disk. While a project is unlocked, anything running as
+you can read its working copy. The sandbox keeps the network, because the model provider needs
+it, so the agent's shell commands can reach the internet too. Rolling the whole folder back to
+an older copy is not detected. A power cut loses chat history since the last lock or "Save to
+vault".
 
 ## FOCUS
 
@@ -92,7 +104,8 @@ cargo build --release                         # the app
 ```
 
 `--features selftest` builds an app that can press its own buttons from a script
-(`ANONCODE_SELFTEST`, described in `src/gui.rs`).
+(`ANONCODE_SELFTEST`, described in `src/gui.rs`). For testing, `ANONCODE_FOCUS_BUDGET` forces a
+FOCUS budget in tokens and `ANONCODE_AGENT_STEPS` caps the agent's steps per turn.
 
 ## License
 

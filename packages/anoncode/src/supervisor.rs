@@ -36,8 +36,9 @@ use crate::store::Store;
 use crate::vault::{random_hex, Vault};
 use crate::{Error, Result};
 
-/// Folders in the agent's own data that are not worth keeping.
-const HOME_SKIP: &[&str] = &["log", "locks", "pty", "node_modules", "target", ".next", "__pycache__", ".venv"];
+/// Folders in the agent's own data that are not kept: logs, locks, and
+/// caches (compiled code, downloaded tools), which are made again.
+const HOME_SKIP: &[&str] = &["log", "locks", "pty", "cache", ".cargo", "tmp", "node_modules", "target", ".next", "__pycache__", ".venv"];
 
 pub struct Config {
     /// The AnonCode folder (the one holding `packages/`).
@@ -53,10 +54,29 @@ struct Open {
     port: u16,
     password: String,
     child: Child,
+    sandboxed: bool,
 }
 
+/// Where the agent finds the project, its own data and its code, inside
+/// the sandbox.
+const SANDBOX_WORK: &str = "/work";
+const SANDBOX_HOME: &str = "/home/agent";
+const SANDBOX_CODE: &str = "/opt/anoncode";
+const SANDBOX_BIN: &str = "/opt/anoncode-bin";
+const SANDBOX_TOOLS: &str = "/opt/tools";
+/// Toolchains in the user's home the agent may run, read-only. Only these:
+/// not `~/.cargo` as a whole, which holds registry credentials.
+const TOOLCHAINS: &[&str] = &[".local/bin", ".local/lib", ".cargo/bin", ".rustup", ".bun/bin"];
+/// System folders the sandbox sees, read-only.
+const SYSTEM: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc"];
+/// Sealed records saying a project's plaintext copies were written out.
+/// Only someone holding the key can make one, so a copy left behind by a
+/// crash is sealed back in only if it was AnonCode's own.
+const MARK_WORK: &str = "work-out";
+const MARK_HOME: &str = "home-out";
+
 /// Settings shared by every project, sealed in the app's vault.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// Model providers and their API keys.
@@ -66,6 +86,59 @@ pub struct Settings {
     /// Providers the agent knows, `(id, name)`, remembered from the last
     /// time an agent was running so they can be listed before one is.
     pub known: Vec<(String, String)>,
+    /// Run the agent in the bubblewrap sandbox.
+    pub sandbox: bool,
+    /// The agent's web-page tool.
+    pub web_fetch: Access,
+    /// Shell commands and file changes: done at once, or asked first.
+    pub approvals: Approvals,
+    /// FOCUS context compression.
+    pub focus: bool,
+    /// When FOCUS starts, as a percentage of the model's context window.
+    pub focus_share: u8,
+    /// Lock AnonCode after this many minutes with no input (0: never).
+    pub auto_lock_minutes: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            providers: Vec::new(),
+            model: None,
+            known: Vec::new(),
+            sandbox: true,
+            web_fetch: Access::Off,
+            approvals: Approvals::Auto,
+            focus: true,
+            focus_share: 60,
+            auto_lock_minutes: 0,
+        }
+    }
+}
+
+impl Settings {
+    /// What an agent is started with: changing these takes effect when a
+    /// project is opened (or reopened).
+    pub fn agent_part(&self) -> (bool, Access, Approvals, bool, u8) {
+        (self.sandbox, self.web_fetch, self.approvals, self.focus, self.focus_share)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    Off,
+    Ask,
+    Allow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Approvals {
+    /// The agent runs commands and changes files without asking.
+    Auto,
+    /// Each command and file change waits for a yes.
+    Ask,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -94,6 +167,8 @@ pub struct Server {
     pub auth: String,
     /// The project's plaintext folder, which the agent works in.
     pub work: PathBuf,
+    /// The same folder as the agent sees it (`/work` in the sandbox).
+    pub agent_work: String,
     /// The agent's unsealed data, sealed with the project on lock.
     pub home: PathBuf,
 }
@@ -124,6 +199,13 @@ impl Manager {
         Ok(Manager { projects: Projects::new(&cfg.base), cfg, open: BTreeMap::new(), app: None })
     }
 
+    fn logged_in_with(&mut self, vault: Vault) -> Result<()> {
+        let app = Store::new(Arc::new(vault), self.cfg.base.join("app"))?;
+        self.projects.seal_index(app.clone())?;
+        self.app = Some(app);
+        Ok(())
+    }
+
     fn app_header(&self) -> PathBuf {
         self.cfg.base.join("vault.json")
     }
@@ -144,20 +226,19 @@ impl Manager {
         }
         let vault = Vault::create(passphrase)?;
         crate::fsx::write_private_atomic(&self.app_header(), &serde_json::to_vec(&vault.header)?, true)?;
-        self.app = Some(Store::new(Arc::new(vault), self.cfg.base.join("app"))?);
-        Ok(())
+        self.logged_in_with(vault)
     }
 
     pub fn login(&mut self, passphrase: &str) -> Result<()> {
         let header = serde_json::from_slice(&fs::read(self.app_header())?)?;
         let vault = Vault::unlock(passphrase, &header)?;
-        self.app = Some(Store::new(Arc::new(vault), self.cfg.base.join("app"))?);
-        Ok(())
+        self.logged_in_with(vault)
     }
 
     /// Locks every project and forgets the app's key.
     pub fn logout(&mut self) {
         self.lock_all();
+        self.projects.forget_index();
         self.app = None;
     }
 
@@ -185,7 +266,7 @@ impl Manager {
     /// vault, and opens it.
     pub fn create(&mut self, name: &str) -> Result<String> {
         let secret = random_hex(32)?;
-        let (meta, vault) = self.projects.create(name, &secret)?;
+        let (meta, vault) = self.projects.create_with_secret(name, &secret)?;
         self.app()?.put_with("keys", &meta.id, secret.as_bytes(), true)?;
         self.start(&meta.id, Arc::new(vault))?;
         Ok(meta.id)
@@ -200,6 +281,21 @@ impl Manager {
         let secret = std::str::from_utf8(&secret).map_err(|_| Error::Damaged)?.to_string();
         let vault = Arc::new(self.projects.unlock(id, &secret)?);
         self.start(id, vault)
+    }
+
+    /// Stops a project's agent and starts it again, so new settings apply.
+    /// Its files and chats are sealed in between, as on a lock.
+    pub fn reopen(&mut self, id: &str) -> Result<()> {
+        if !self.open.contains_key(id) {
+            return Ok(());
+        }
+        self.lock(id)?;
+        self.open(id)
+    }
+
+    /// The projects open now.
+    pub fn open_ids(&self) -> Vec<String> {
+        self.open.keys().cloned().collect()
     }
 
     pub fn rename(&mut self, id: &str, name: &str) -> Result<()> {
@@ -227,97 +323,244 @@ impl Manager {
         let store = self.store(&vault, &paths)?;
         kill_stale(&paths.run);
         let mut project = Efs::open(store.clone(), "project")?;
-        let mut state = Efs::open(store, "state")?;
-        // A folder with its marker was left by a crash or a kill: its
-        // plaintext is newer than what is sealed, so it is sealed before
-        // anything else. A folder without one is not trusted (it may be
-        // half written, or gone with a reboot) and is written out afresh.
-        if paths.run.join(".ready").is_file() {
+        let mut state = Efs::open(store.clone(), "state")?;
+        // A plaintext copy left by a crash or a kill is newer than what is
+        // sealed, so it is sealed before anything else, but only if it is
+        // AnonCode's own: a sealed marker says it was written out, and the
+        // folder must still be closed to everyone else. Otherwise it is
+        // thrown away and written out afresh.
+        if store.has("meta", MARK_WORK) && crate::fsx::is_private_dir(&paths.run) && paths.work.is_dir() {
             runspace::sync_back(&mut project, &paths.work)?;
         } else {
             runspace::wipe(&paths.run)?;
+            create_private_dir(&paths.run)?;
             runspace::materialize(&project, &paths.work)?;
-            fs::write(paths.run.join(".ready"), b"")?;
+            store.put_with("meta", MARK_WORK, b"1", true)?;
         }
-        if paths.scratch.join(".ready").is_file() {
+        if store.has("meta", MARK_HOME) && crate::fsx::is_private_dir(&paths.scratch) && paths.home.is_dir() {
             runspace::sync_back_skipping(&mut state, &paths.home, HOME_SKIP)?;
         } else {
             if paths.scratch != paths.run {
                 runspace::wipe(&paths.scratch)?;
             }
-            runspace::materialize(&state, &paths.home)?;
             create_private_dir(&paths.scratch)?;
-            fs::write(paths.scratch.join(".ready"), b"")?;
+            runspace::materialize(&state, &paths.home)?;
+            store.put_with("meta", MARK_HOME, b"1", true)?;
         }
         create_private_dir(&paths.work)?;
         create_private_dir(&paths.home)?;
-        let (child, port, password) = self.spawn_server(&paths)?;
-        self.open.insert(id.to_string(), Open { vault, port, password, child });
+        let (child, port, password, sandboxed) = self.spawn_server(&paths)?;
+        self.open.insert(id.to_string(), Open { vault, port, password, child, sandboxed });
         Ok(())
     }
 
-    fn spawn_server(&self, paths: &ProjectPaths) -> Result<(Child, u16, String)> {
-        let port = free_port(preferred_port(&paths.dir))?;
+    /// Starts the agent server for an unlocked project, in a sandbox.
+    ///
+    /// The sandbox (bubblewrap) sees the system folders and a few
+    /// toolchains read-only, AnonCode's code read-only, the project at
+    /// `/work` and the agent's own data at `/home/agent`, and nothing else
+    /// of the disk: not the user's home, not the AnonCode folder's own
+    /// instruction files above the project, not other projects. /tmp and
+    /// /run are private. It starts with an empty environment, so no API
+    /// key or setting from the user's shell reaches the agent. It keeps the
+    /// network, which the model provider needs; so do the agent's tools.
+    ///
+    /// Without bubblewrap it refuses to start, unless `ANONCODE_NO_SANDBOX`
+    /// is set: then the agent runs as the user, still with an empty
+    /// environment.
+    fn spawn_server(&self, paths: &ProjectPaths) -> Result<(Child, u16, String, bool)> {
+        let port = TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port();
         let password = random_hex(24)?;
-        let tmp = paths.scratch.join("tmp");
-        create_private_dir(&tmp)?;
-        let cache = self.cfg.base.join("cache");
-        create_private_dir(&cache)?;
         let log = fs::File::options().create(true).append(true).open(paths.scratch.join("server.log"))?;
+        let home_dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"].into_iter().map(PathBuf::from).find(|p| p.is_file());
+        let settings = self.settings().unwrap_or_default();
+        let sandboxed = self.cfg.server_command.is_empty() && settings.sandbox && std::env::var_os("ANONCODE_NO_SANDBOX").is_none();
+        if sandboxed && bwrap.is_none() {
+            return Err(other("the agent runs in a sandbox, and bubblewrap (bwrap) isn't installed. Install it (Debian: apt install bubblewrap), or turn the sandbox off in Settings."));
+        }
+
+        // The paths the agent is given, inside the sandbox or not.
+        let (code, work, home, bin) = if sandboxed {
+            (PathBuf::from(SANDBOX_CODE), PathBuf::from(SANDBOX_WORK), PathBuf::from(SANDBOX_HOME), PathBuf::from(SANDBOX_BIN))
+        } else {
+            (self.cfg.root.clone(), paths.work.clone(), paths.home.clone(), exe.clone())
+        };
+        let tools: Vec<&str> = TOOLCHAINS.iter().copied().filter(|t| home_dir.join(t).exists()).collect();
+        let mut path: Vec<String> = Vec::new();
+        for t in [".local/bin", ".cargo/bin", ".bun/bin"] {
+            if tools.contains(&t) {
+                path.push(if sandboxed { format!("{SANDBOX_TOOLS}/{t}") } else { home_dir.join(t).to_string_lossy().into_owned() });
+            }
+        }
+        path.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
+        let plugins: Vec<String> = ["loop", "focus", "privacy"]
+            .iter()
+            .filter(|p| self.cfg.root.join("packages/anoncode-plugins").join(p).is_dir())
+            .map(|p| code.join("packages/anoncode-plugins").join(p).to_string_lossy().into_owned())
+            .collect();
+        // Nothing goes to opencode's servers: its hosted models, web search
+        // and sharing are off, and models come only from providers the user
+        // gives a key. The agent may not fetch web pages either.
+        let deny = |action: &str, resource: &str| serde_json::json!({ "action": action, "resource": resource, "effect": "deny" });
+        let mut policies = vec![deny("provider.use", "opencode"), deny("integration.use", "opencode"), deny("integration.connect", "opencode"), deny("websearch.use", "*")];
+        // Rules for the agent's tools, the last match winning. Off is a
+        // policy, which nothing can override; ask and allow are rules.
+        let rule = |action: &str, effect: &str| serde_json::json!({ "action": action, "resource": "*", "effect": effect });
+        let mut permissions = Vec::new();
+        match settings.web_fetch {
+            Access::Off => policies.push(deny("tool.use", "webfetch:*")),
+            Access::Ask => permissions.push(rule("webfetch", "ask")),
+            Access::Allow => permissions.push(rule("webfetch", "allow")),
+        }
+        if settings.approvals == Approvals::Ask {
+            for tool in ["shell", "edit", "write", "patch"] {
+                permissions.push(rule(tool, "ask"));
+            }
+        }
+        let mut config = serde_json::json!({
+            "plugins": plugins,
+            "share": "disabled",
+            "policies": policies,
+            "permissions": permissions,
+        });
+        // For testing the reviewer loop: caps the agent's steps per turn, so
+        // a bigger task can't be finished in one.
+        if let Some(steps) = std::env::var("ANONCODE_AGENT_STEPS").ok().and_then(|v| v.parse::<u32>().ok()) {
+            config["agents"] = serde_json::json!({ "build": { "steps": steps } });
+        }
+        let mut env: Vec<(String, String)> = vec![
+            ("PATH".into(), path.join(":")),
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("LANG".into(), std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into())),
+            ("TERM".into(), "xterm-256color".into()),
+            ("XDG_DATA_HOME".into(), home.join("data").to_string_lossy().into_owned()),
+            ("XDG_CONFIG_HOME".into(), home.join("config").to_string_lossy().into_owned()),
+            ("XDG_STATE_HOME".into(), home.join("state").to_string_lossy().into_owned()),
+            // Caches (compiled code, downloaded tools) live and die with the
+            // agent's data in RAM; they are not sealed.
+            ("XDG_CACHE_HOME".into(), home.join("cache").to_string_lossy().into_owned()),
+            ("CARGO_HOME".into(), home.join(".cargo").to_string_lossy().into_owned()),
+            ("TMPDIR".into(), if sandboxed { "/tmp".into() } else { paths.scratch.join("tmp").to_string_lossy().into_owned() }),
+            ("OPENCODE_PASSWORD".into(), password.clone()),
+            ("OPENCODE_DISABLE_CHANNEL_DB".into(), "1".into()),
+            // The model list comes from the copy shipped with the agent.
+            ("OPENCODE_DISABLE_MODELS_FETCH".into(), "1".into()),
+            ("OPENCODE_DISABLE_AUTOUPDATE".into(), "1".into()),
+            ("OPENCODE_CONFIG_CONTENT".into(), config.to_string()),
+            ("ANONCODE_WORK".into(), work.to_string_lossy().into_owned()),
+            ("ANONCODE_BIN".into(), bin.to_string_lossy().into_owned()),
+        ];
+        if tools.contains(&".rustup") {
+            env.push(("RUSTUP_HOME".into(), if sandboxed { format!("{SANDBOX_TOOLS}/.rustup") } else { home_dir.join(".rustup").to_string_lossy().into_owned() }));
+        }
+        env.push(("ANONCODE_FOCUS".into(), if settings.focus { "on".into() } else { "off".into() }));
+        env.push(("ANONCODE_FOCUS_SHARE".into(), settings.focus_share.clamp(20, 95).to_string()));
+        if let Ok(budget) = std::env::var("ANONCODE_FOCUS_BUDGET") {
+            env.push(("ANONCODE_FOCUS_BUDGET".into(), budget));
+        }
+        if !sandboxed {
+            create_private_dir(&paths.scratch.join("tmp"))?;
+        }
 
         let mut argv = self.cfg.server_command.clone();
         if argv.is_empty() {
             argv = ["bun", "run", "--cwd"].map(String::from).to_vec();
-            argv.push(self.cfg.root.join("packages/cli").to_string_lossy().into_owned());
+            argv.push(code.join("packages/cli").to_string_lossy().into_owned());
             argv.extend(["src/index.ts", "serve"].map(String::from));
         }
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .args(["--port", &port.to_string(), "--hostname", "127.0.0.1"])
-            .env("XDG_DATA_HOME", paths.home.join("data"))
-            .env("XDG_CONFIG_HOME", paths.home.join("config"))
-            .env("XDG_STATE_HOME", paths.home.join("state"))
-            .env("XDG_CACHE_HOME", &cache)
-            .env("TMPDIR", &tmp)
-            .env("OPENCODE_PASSWORD", &password)
-            .env("OPENCODE_DISABLE_CHANNEL_DB", "1")
-            // The model list comes from the copy shipped with the agent, not from the network.
-            .env("OPENCODE_DISABLE_MODELS_FETCH", "1")
-            .env("ANONCODE_WORK", &paths.work)
-            .env("ANONCODE_BIN", std::env::current_exe().unwrap_or_default())
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
-        let plugins: Vec<String> = ["loop", "focus"]
-            .iter()
-            .map(|p| self.cfg.root.join("packages/anoncode-plugins").join(p))
-            .filter(|p| p.is_dir())
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
-        // opencode's own hosted models, web search and session sharing are
-        // switched off: nothing goes to its servers. Models come only from
-        // providers the user connects with their own key.
-        let deny = |action: &str| serde_json::json!({ "action": action, "resource": "opencode", "effect": "deny" });
-        let config = serde_json::json!({
-            "plugins": plugins,
-            "share": "disabled",
-            "policies": [deny("provider.use"), deny("integration.use"), deny("integration.connect"), deny("websearch.use")],
-        });
-        cmd.env("OPENCODE_CONFIG_CONTENT", config.to_string());
+        argv.extend(["--port".to_string(), port.to_string(), "--hostname".into(), "127.0.0.1".into()]);
+
+        let mut cmd = if sandboxed {
+            let mut c = Command::new(bwrap.unwrap());
+            let mut a: Vec<String> = Vec::new();
+            let mut add = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
+            for d in SYSTEM {
+                if Path::new(d).exists() {
+                    add(&["--ro-bind", d, d]);
+                }
+            }
+            add(&["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run"]);
+            // DNS settings that point into /run (systemd-resolved).
+            if let Ok(real) = fs::canonicalize("/etc/resolv.conf") {
+                if real.starts_with("/run") {
+                    let r = real.to_string_lossy().into_owned();
+                    add(&["--ro-bind", &r, &r]);
+                }
+            }
+            // A neutral user and machine name: the real ones are not the
+            // agent's business, and it would pass them on to the model.
+            let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+            let ids = paths.scratch.join("ids");
+            create_private_dir(&ids)?;
+            fs::write(ids.join("passwd"), format!("root:x:0:0:root:/root:/bin/sh\nagent:x:{uid}:{gid}:agent:{SANDBOX_HOME}:/bin/sh\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\n"))?;
+            fs::write(ids.join("group"), format!("root:x:0:\nagent:x:{gid}:\nnogroup:x:65534:\n"))?;
+            fs::write(ids.join("hostname"), "anoncode\n")?;
+            fs::write(ids.join("hosts"), "127.0.0.1 localhost anoncode\n::1 localhost\n")?;
+            for f in ["passwd", "group", "hostname", "hosts"] {
+                let src = ids.join(f).to_string_lossy().into_owned();
+                add(&["--ro-bind", &src, &format!("/etc/{f}")]);
+            }
+            add(&["--hostname", "anoncode"]);
+            let root = self.cfg.root.to_string_lossy().into_owned();
+            add(&["--ro-bind", &root, SANDBOX_CODE]);
+            // A project's own .anoncode can't be inside the code it reads.
+            let base_in_code = self.cfg.base.strip_prefix(&self.cfg.root).ok().map(|rel| format!("{SANDBOX_CODE}/{}", rel.display()));
+            if let Some(hidden) = &base_in_code {
+                add(&["--tmpfs", hidden]);
+            }
+            let exe_s = exe.to_string_lossy().into_owned();
+            add(&["--ro-bind", &exe_s, SANDBOX_BIN]);
+            for t in &tools {
+                let host = home_dir.join(t).to_string_lossy().into_owned();
+                add(&["--ro-bind", &host, &format!("{SANDBOX_TOOLS}/{t}")]);
+            }
+            let (h, w) = (paths.home.to_string_lossy().into_owned(), paths.work.to_string_lossy().into_owned());
+            // bun finds its preload modules from the folder it starts in, so
+            // the server starts in its own package; the agent works in /work.
+            add(&["--bind", &h, SANDBOX_HOME, "--bind", &w, SANDBOX_WORK, "--chdir", &format!("{SANDBOX_CODE}/packages/cli")]);
+            // No --die-with-parent: it fires when the thread that started the
+            // sandbox ends, not the app. Locking stops the server, and one left
+            // by a crash is stopped at the next unlock.
+            add(&["--unshare-all", "--share-net", "--clearenv"]);
+            for (k, v) in &env {
+                add(&["--setenv", k, v]);
+            }
+            a.push("--".into());
+            c.args(&a).args(&argv);
+            c.env_clear();
+            c
+        } else {
+            let mut c = Command::new(&argv[0]);
+            c.args(&argv[1..]).env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            if self.cfg.server_command.is_empty() {
+                // bun is looked up on the agent's PATH.
+                if let Some(bun) = path.iter().map(|d| Path::new(d).join("bun")).find(|p| p.is_file()) {
+                    c = Command::new(bun);
+                    c.args(&argv[1..]).env_clear().envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                }
+            }
+            c
+        };
+        if !sandboxed {
+            cmd.current_dir(self.cfg.root.join("packages/cli"));
+        }
+        cmd.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
             // Its own process group, so the whole tree can be stopped.
             cmd.process_group(0);
         }
-        let mut child = cmd.spawn().map_err(|e| other(format!("could not start the agent server ({}): {e}", argv[0])))?;
+        let mut child = cmd.spawn().map_err(|e| other(format!("could not start the agent server: {e}")))?;
         fs::write(paths.run.join("server.pid"), child.id().to_string())?;
 
         let basic = B64.encode(format!("opencode:{password}"));
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             if matches!(http::get_status(port, "/api/info", &basic), Ok(200)) {
-                return Ok((child, port, password));
+                return Ok((child, port, password, sandboxed));
             }
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(other(format!("the agent server stopped ({status}):\n{}", tail(&paths.scratch.join("server.log")))));
@@ -352,7 +595,11 @@ impl Manager {
         let paths = self.projects.paths(id)?;
         runspace::wipe(&paths.scratch)?;
         runspace::wipe(&paths.run)?;
-        self.open.remove(id);
+        if let Some(open) = self.open.remove(id) {
+            let store = self.store(&open.vault, &paths)?;
+            store.remove("meta", MARK_WORK)?;
+            store.remove("meta", MARK_HOME)?;
+        }
         Ok(())
     }
 
@@ -408,25 +655,13 @@ impl Manager {
             out.push(ProjectView {
                 open: open.is_some(),
                 known: self.app.as_ref().is_some_and(|a| a.has("keys", &p.id)),
-                server: open.map(|o| Server { port: o.port, auth: format!("Basic {}", B64.encode(format!("opencode:{}", o.password))), work: paths.work.clone(), home: paths.home.clone() }),
+                server: open.map(|o| Server { port: o.port, auth: format!("Basic {}", B64.encode(format!("opencode:{}", o.password))), work: paths.work.clone(), agent_work: if o.sandboxed { SANDBOX_WORK.to_string() } else { paths.work.to_string_lossy().into_owned() }, home: paths.home.clone() }),
                 id: p.id,
                 name: p.name,
             });
         }
         Ok(out)
     }
-}
-
-fn preferred_port(dir: &Path) -> u16 {
-    let h = dir.to_string_lossy().bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    47200 + (h % 700) as u16
-}
-
-fn free_port(preferred: u16) -> Result<u16> {
-    if TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
-        return Ok(preferred);
-    }
-    Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
 }
 
 fn stop(child: &mut Child) {
@@ -455,8 +690,9 @@ fn kill_stale(run: &Path) {
     let _ = fs::remove_file(run.join("server.pid"));
     #[cfg(unix)]
     if let Ok(pid) = pid.trim().parse::<i32>() {
-        // Only if that process group still runs out of this run/ folder.
-        let ours = fs::read(format!("/proc/{pid}/environ")).map(|e| String::from_utf8_lossy(&e).contains(&*run.to_string_lossy())).unwrap_or(false);
+        // Only if that process still runs for this project: its command
+        // line names the project's folder.
+        let ours = fs::read(format!("/proc/{pid}/cmdline")).map(|e| String::from_utf8_lossy(&e).contains(&*run.to_string_lossy())).unwrap_or(false);
         if pid > 1 && ours {
             unsafe {
                 libc::killpg(pid, libc::SIGTERM);

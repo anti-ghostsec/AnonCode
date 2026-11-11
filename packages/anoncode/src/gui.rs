@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroize;
 
 use crate::api::Client;
-use crate::supervisor::{Config, Manager, ProjectView, Provider, Settings};
+use crate::supervisor::{Access, Approvals, Config, Manager, ProjectView, Provider, Settings};
 use crate::Result;
 
 /// Set by Ctrl+C and friends: close the window, which locks everything.
@@ -135,6 +135,10 @@ struct App {
     /// Shared by every project; sealed in the app's vault.
     settings: Settings,
     show_settings: bool,
+    /// The agent settings the open projects were started with.
+    started_with: Option<(bool, Access, Approvals, bool, u8)>,
+    /// When the user last did anything, for the auto-lock.
+    last_input: std::time::Instant,
     set_filter: String,
     set_chosen: String,
     set_key: String,
@@ -334,6 +338,8 @@ impl App {
             press_login: false,
             settings: Settings::default(),
             show_settings: false,
+            started_with: None,
+            last_input: std::time::Instant::now(),
             set_filter: String::new(),
             set_chosen: String::new(),
             set_key: String::new(),
@@ -451,6 +457,47 @@ impl App {
         }
     }
 
+    /// Restarts every open project's agent with the current settings.
+    fn reopen_all(&mut self) {
+        let ids: Vec<String> = self.tabs.keys().cloned().collect();
+        for id in &ids {
+            if let Some(tab) = self.tabs.remove(id) {
+                tab.shared.stop.store(true, Ordering::SeqCst);
+            }
+            self.busy.insert(id.clone());
+        }
+        let wanted = self.settings.agent_part();
+        self.started_with = Some(wanted);
+        let (manager, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
+        std::thread::spawn(move || {
+            let mut m = manager.lock().unwrap();
+            let mut problems = Vec::new();
+            for id in &ids {
+                if let Err(e) = m.reopen(id) {
+                    problems.push(format!("{id}: {e}"));
+                }
+            }
+            let _ = tx.send(Msg::Projects(m.list().unwrap_or_default()));
+            for id in ids {
+                let _ = tx.send(Msg::Done { id, result: if problems.is_empty() { Ok("Reopened with the new settings.".into()) } else { Err(problems.join("\n")) } });
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Locks everything and asks for the passphrase again.
+    fn lock_app(&mut self) {
+        let (manager, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
+        for tab in self.tabs.values() {
+            tab.shared.stop.store(true, Ordering::SeqCst);
+        }
+        std::thread::spawn(move || {
+            manager.lock().unwrap().logout();
+            let _ = tx.send(Msg::LoggedOut);
+            ctx.request_repaint();
+        });
+    }
+
     /// Opens a project whose secret the app's vault holds.
     fn open_project(&mut self, id: &str) {
         let target = id.to_string();
@@ -462,6 +509,11 @@ impl App {
             match msg {
                 Msg::Projects(list) => {
                     self.projects = list;
+                    if !self.projects.iter().any(|p| p.open) {
+                        self.started_with = None;
+                    } else if self.started_with.is_none() {
+                        self.started_with = Some(self.settings.agent_part());
+                    }
                     for p in &self.projects {
                         if p.open && !self.tabs.contains_key(&p.id) {
                             if let Some(mut tab) = Tab::new(&p.id, p, &self.tx, &self.ctx) {
@@ -617,14 +669,16 @@ impl App {
             ui.separator();
             let mut select = None;
             for p in &self.projects {
-                let state = if self.busy.contains(&p.id) {
-                    "… "
+                // A closed project's name is dimmed (the default font has no
+                // lock symbol); one being opened or closed gets an ellipsis.
+                let name = clip(&p.name, 28);
+                let label = if self.busy.contains(&p.id) {
+                    RichText::new(format!("{name} …"))
                 } else if p.open {
-                    ""
+                    RichText::new(name)
                 } else {
-                    "🔒 "
+                    RichText::new(name).weak().italics()
                 };
-                let label = format!("{state}{}", clip(&p.name, 28));
                 let r = ui
                     .selectable_label(!self.creating && p.id == self.selected, label)
                     .on_hover_text(format!("{} ({}). Double-click to rename, right-click for more.", p.name, if p.open { "unlocked" } else { "locked" }));
@@ -801,6 +855,7 @@ impl App {
         let mut open = true;
         let mut changed = false;
         let mut logout = false;
+        let mut reopen = false;
         egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, -20.0]).show(ctx, |ui| {
             ui.set_width(460.0);
             ui.strong("Model providers");
@@ -832,7 +887,10 @@ impl App {
             let needle = self.set_filter.trim().to_lowercase();
             // Until an agent has run once, only a short list is known.
             let builtin = [("venice", "Venice AI"), ("openrouter", "OpenRouter"), ("openai", "OpenAI"), ("groq", "Groq"), ("deepseek", "DeepSeek"), ("mistral", "Mistral"), ("xai", "xAI")];
-            let known: Vec<(String, String)> = if self.settings.known.is_empty() { builtin.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() } else { self.settings.known.clone() };
+            let mut known: Vec<(String, String)> = if self.settings.known.is_empty() { builtin.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() } else { self.settings.known.clone() };
+            // The common ones first, then the rest by name.
+            let first = ["venice", "openrouter", "anthropic", "openai", "google", "deepseek", "groq", "mistral", "xai", "ollama", "lmstudio"];
+            known.sort_by_key(|(id, name)| (first.iter().position(|f| f == id).unwrap_or(first.len()), name.to_lowercase()));
             ScrollArea::vertical().max_height(170.0).auto_shrink([false, true]).show(ui, |ui| {
                 for (id, name) in known.iter().filter(|(id, name)| needle.is_empty() || id.contains(&needle) || name.to_lowercase().contains(&needle)) {
                     if ui.selectable_label(self.set_chosen == *id, name).clicked() {
@@ -857,6 +915,59 @@ impl App {
                 }
             }
             ui.separator();
+            ui.strong("The agent");
+            let before = self.settings.agent_part();
+            ui.checkbox(&mut self.settings.sandbox, "Run the agent in a sandbox (bubblewrap)")
+                .on_hover_text("It sees only the project and its own data, never your home folder, and starts with none of your environment. Turn off only if a tool you need can't work inside it.");
+            if !self.settings.sandbox {
+                ui.colored_label(ui.visuals().warn_fg_color, "Without the sandbox the agent can read and change everything your account can.");
+            }
+            ui.horizontal(|ui| {
+                ui.label("Fetching web pages:");
+                for (label, value) in [("Off", Access::Off), ("Ask each time", Access::Ask), ("Allowed", Access::Allow)] {
+                    ui.radio_value(&mut self.settings.web_fetch, value, label);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Commands and file changes:");
+                ui.radio_value(&mut self.settings.approvals, Approvals::Auto, "Just do them");
+                ui.radio_value(&mut self.settings.approvals, Approvals::Ask, "Ask me first");
+            });
+            ui.checkbox(&mut self.settings.focus, "FOCUS: leave out old, low-value parts of long chats")
+                .on_hover_text("Nothing is summarised or changed in the chat; old tool output is simply not sent again. Your messages, errors and recent work always stay.");
+            ui.add_enabled_ui(self.settings.focus, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Start when a chat fills");
+                    ui.add(egui::Slider::new(&mut self.settings.focus_share, 30..=90).suffix("%"));
+                    ui.label("of the model's context");
+                });
+            });
+            if self.settings.agent_part() != before {
+                changed = true;
+            }
+            if self.started_with.is_some_and(|s| s != self.settings.agent_part()) {
+                ui.horizontal(|ui| {
+                    ui.colored_label(ui.visuals().warn_fg_color, "Open projects still use the old settings.");
+                    if ui.button("Reopen them now").on_hover_text("Each open project is saved to its vault and its agent restarted").clicked() {
+                        reopen = true;
+                    }
+                });
+            }
+            ui.separator();
+            ui.strong("Lock");
+            ui.horizontal(|ui| {
+                ui.label("Lock AnonCode after");
+                let mut minutes = self.settings.auto_lock_minutes;
+                egui::ComboBox::from_id_salt("autolock").selected_text(if minutes == 0 { "never".to_string() } else { format!("{minutes} minutes idle") }).show_ui(ui, |ui| {
+                    for m in [0u32, 5, 15, 30, 60] {
+                        ui.selectable_value(&mut minutes, m, if m == 0 { "never".to_string() } else { format!("{m} minutes idle") });
+                    }
+                });
+                if minutes != self.settings.auto_lock_minutes {
+                    self.settings.auto_lock_minutes = minutes;
+                    changed = true;
+                }
+            });
             ui.horizontal(|ui| {
                 if ui.button("Lock AnonCode").on_hover_text("Seal and close every project and ask for the passphrase again").clicked() {
                     logout = true;
@@ -867,16 +978,11 @@ impl App {
         if changed {
             self.settings_changed();
         }
+        if reopen {
+            self.reopen_all();
+        }
         if logout {
-            let (manager, tx, ctx) = (self.manager.clone(), self.tx.clone(), self.ctx.clone());
-            for tab in self.tabs.values() {
-                tab.shared.stop.store(true, Ordering::SeqCst);
-            }
-            std::thread::spawn(move || {
-                manager.lock().unwrap().logout();
-                let _ = tx.send(Msg::LoggedOut);
-                ctx.request_repaint();
-            });
+            self.lock_app();
         }
         if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.show_settings = false;
@@ -1095,7 +1201,7 @@ impl App {
                         let mut send = edit.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                         ui.horizontal(|ui| {
                             if round_button(ui, Icon::Plus, true).on_hover_text("Attach files. You can also drop files on the window.").clicked() {
-                                open_dialog = Some(attach_dialog(&id, PathBuf::from(tab.client.directory())));
+                                open_dialog = Some(attach_dialog(&id, tab.client.host_dir().to_path_buf()));
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if working && !ready {
@@ -1218,7 +1324,7 @@ impl App {
                             go = dir.parent().map(PathBuf::from);
                         }
                         if ui.button("Project").on_hover_text("This project's files").clicked() {
-                            go = Some(PathBuf::from(tab.client.directory()));
+                            go = Some(tab.client.host_dir().to_path_buf());
                         }
                         if ui.button("Home").clicked() {
                             go = std::env::var_os("HOME").map(PathBuf::from);
@@ -1520,6 +1626,15 @@ impl eframe::App for App {
         // Wake up now and then even with no input, to notice a signal.
         ui.ctx().request_repaint_after(Duration::from_millis(500));
         self.take_messages();
+        // Auto-lock: any input counts as use; a working agent keeps it open.
+        if ui.ctx().input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.last_input = std::time::Instant::now();
+        }
+        let minutes = self.settings.auto_lock_minutes;
+        if self.logged_in && minutes > 0 && !self.tabs.values().any(|t| t.working()) && self.last_input.elapsed() > Duration::from_secs(60 * minutes as u64) {
+            self.last_input = std::time::Instant::now();
+            self.lock_app();
+        }
         // Files dropped on the window are attached to the chat on screen.
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if let (false, Some(tab)) = (dropped.is_empty(), self.tabs.get_mut(&self.selected)) {
@@ -1648,6 +1763,39 @@ mod selftest {
                 app.settings.providers.retain(|p| p.id != provider);
                 app.settings.providers.push(Provider { id: provider.to_string(), key: std::env::var(var).unwrap_or_default() });
                 app.settings_changed();
+                true
+            }
+            "set" => {
+                // set webfetch off|ask|allow, set sandbox on|off, set approvals auto|ask, set focus on|off, set reopen
+                let (what, value) = rest.split_once(' ').unwrap_or((rest, ""));
+                match (what, value) {
+                    ("webfetch", v) => app.settings.web_fetch = match v { "ask" => Access::Ask, "allow" => Access::Allow, _ => Access::Off },
+                    ("sandbox", v) => app.settings.sandbox = v == "on",
+                    ("approvals", v) => app.settings.approvals = if v == "ask" { Approvals::Ask } else { Approvals::Auto },
+                    ("focus", v) => app.settings.focus = v == "on",
+                    ("reopen", _) => app.reopen_all(),
+                    _ => {}
+                }
+                if what != "reopen" {
+                    app.settings_changed();
+                }
+                true
+            }
+            "allow" => {
+                // Answer the first waiting permission request: once or reject.
+                let session = app.tabs.get(&id).map(|t| t.session()).unwrap_or_default();
+                let Some(tab) = app.tabs.get(&id) else { return };
+                let Some(p) = tab.permissions.iter().find(|p| p["sessionID"] == session.as_str()).cloned() else {
+                    app.script.started = false;
+                    return;
+                };
+                let (client, request_id, decision) = (tab.client.clone(), text(&p, "id"), if rest == "no" { "reject" } else { "once" });
+                eprintln!("selftest: answering {} {}", text(&p, "action"), decision);
+                request(&app.tx, &app.ctx, &id, move || client.reply_permission(&session, &request_id, decision));
+                true
+            }
+            "settings" => {
+                app.show_settings = true;
                 true
             }
             "noprovider" => {

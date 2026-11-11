@@ -11,7 +11,10 @@ use crate::supervisor::Server;
 pub struct Client {
     base: String,
     auth: String,
+    /// The project's folder as the agent sees it.
     directory: String,
+    /// The same folder on this machine.
+    host_dir: std::path::PathBuf,
     agent: ureq::Agent,
 }
 
@@ -26,13 +29,19 @@ impl Client {
         Client {
             base: format!("http://127.0.0.1:{}", server.port),
             auth: server.auth.clone(),
-            directory: server.work.to_string_lossy().into_owned(),
-            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)).timeout(Duration::from_secs(60)).build(),
+            directory: server.agent_work.clone(),
+            host_dir: server.work.clone(),
+            agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(3)).timeout(Duration::from_secs(120)).build(),
         }
     }
 
     pub fn directory(&self) -> &str {
         &self.directory
+    }
+
+    /// The project's folder on this machine.
+    pub fn host_dir(&self) -> &std::path::Path {
+        &self.host_dir
     }
 
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> ApiResult<Value> {
@@ -104,19 +113,24 @@ impl Client {
         Ok(list)
     }
 
-    /// Sends a message, with any files to attach. The server reads each
-    /// file itself and keeps its bytes with the chat (sealed with it).
+    /// Sends a message, with any files to attach. Each file is read here
+    /// and sent with the message: the agent (in its sandbox) can't read
+    /// your folders, and never learns where a file came from.
     pub fn prompt(&self, id: &str, text: &str, files: &[std::path::PathBuf]) -> ApiResult<()> {
-        let files: Vec<Value> = files
-            .iter()
-            .map(|path| {
-                let uri: String = path.to_string_lossy().bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-                json!({ "uri": format!("file://{uri}"), "name": path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default() })
-            })
-            .collect();
+        use base64::Engine;
+        let mut list = Vec::new();
+        for path in files {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let bytes = std::fs::read(path).map_err(|e| format!("Could not read {name}: {e}"))?;
+            if bytes.len() > 20 * 1024 * 1024 {
+                return Err(format!("{name} is over the 20 MB limit for an attachment."));
+            }
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            list.push(json!({ "uri": format!("data:application/octet-stream;base64,{data}"), "name": name }));
+        }
         let mut body = json!({ "text": text });
-        if !files.is_empty() {
-            body["files"] = Value::Array(files);
+        if !list.is_empty() {
+            body["files"] = Value::Array(list);
         }
         self.call("POST", &format!("/api/session/{id}/prompt"), Some(body)).map(|_| ())
     }

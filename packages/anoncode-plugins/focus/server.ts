@@ -119,17 +119,21 @@ export default Plugin.define({
       const forced = Number(process.env.ANONCODE_FOCUS_BUDGET)
       if (forced > 0) return forced
       if (options.budgetTokens) return options.budgetTokens
+      const share = Number(process.env.ANONCODE_FOCUS_SHARE) / 100
       const key = `${model.providerID}/${model.id}`
       if (!limits.has(key)) {
         const listed = await ctx.model.list().catch(() => undefined)
         const found = (listed?.data ?? []).find((item) => item.providerID === model.providerID && item.id === model.id)
         const window = found ? Math.min(found.limit.input ?? found.limit.context, found.limit.context) : 0
-        limits.set(key, window > 0 ? Math.floor(window * (options.share ?? DEFAULT_SHARE)) : FALLBACK_BUDGET)
+        limits.set(key, window > 0 ? Math.floor(window * (share > 0 ? share : (options.share ?? DEFAULT_SHARE))) : FALLBACK_BUDGET)
       }
       return limits.get(key) ?? FALLBACK_BUDGET
     }
 
+    // Switched off for every project in AnonCode's Settings.
+    const disabled = process.env.ANONCODE_FOCUS === "off"
     await ctx.session.hook("context", async (event) => {
+      if (disabled) return
       const current = await state(event.sessionID)
       if (current.off) return
       const spans = buildSpans(event.messages as unknown as LlmMessage[])
@@ -176,7 +180,11 @@ export default Plugin.define({
           // A command reports by failing with its text, which the interface shows as a notice.
           throw new Error(
             [
-              current.off ? "FOCUS is off for this conversation: everything is sent." : "FOCUS is on for this conversation.",
+              disabled
+                ? "FOCUS is off in AnonCode's Settings: everything is sent."
+                : current.off
+                  ? "FOCUS is off for this conversation: everything is sent."
+                  : "FOCUS is on for this conversation.",
               current.dropped.length === 0
                 ? "Nothing has been left out yet."
                 : `${current.dropped.length} spans are left out of what the model is sent. They are still in the conversation here.`,

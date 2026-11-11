@@ -33,9 +33,15 @@ fn cheap_or_huge_cost_is_refused_before_deriving() {
     let v = vault();
     assert!(matches!(Vault::unlock("correct horse", &v.header), Err(Error::Kdf)));
     let mut huge = v.header.clone();
-    huge.kdf.n = 1 << 30;
+    huge.kdf.memory_kib = 4 * 1024 * 1024;
     assert!(matches!(Vault::unlock("correct horse", &huge), Err(Error::Kdf)));
+    let mut unknown = v.header.clone();
+    unknown.kdf.algo = "pbkdf2".into();
+    assert!(matches!(Vault::unlock_with("correct horse", &unknown, false), Err(Error::Kdf)));
     assert!(KdfParams::default_cost().check().is_ok());
+    assert!(KdfParams::for_random_secret().check().is_ok());
+    assert!(KdfParams::scrypt_v1().check().is_ok());
+    assert_eq!(KdfParams::default_cost().algo, "argon2id");
 }
 
 #[test]
@@ -286,7 +292,9 @@ fn one_login_holds_the_shared_settings() {
     assert!(m.settings().is_err(), "nothing is readable before a login");
     m.setup("one passphrase").unwrap();
     assert!(m.setup("another").is_err(), "the passphrase is set only once");
-    let settings = Settings { providers: vec![Provider { id: "venice".into(), key: "sk-test-123".into() }], model: Some(("venice".into(), "m".into())), known: vec![] };
+    let settings = Settings { providers: vec![Provider { id: "venice".into(), key: "sk-test-123".into() }], model: Some(("venice".into(), "m".into())), web_fetch: anoncode::supervisor::Access::Ask, focus_share: 40, ..Settings::default() };
+    assert!(Settings::default().sandbox, "the sandbox is on unless turned off");
+    assert_eq!(Settings::default().web_fetch, anoncode::supervisor::Access::Off);
     m.save_settings(&settings).unwrap();
     m.logout();
     assert!(m.settings().is_err());
@@ -301,4 +309,64 @@ fn one_login_holds_the_shared_settings() {
     assert!(!m.logged_in());
     m.login("one passphrase").unwrap();
     assert_eq!(m.settings().unwrap(), settings);
+}
+
+#[test]
+fn a_record_copied_over_another_does_not_open() {
+    let dir = tmp("swap");
+    let s = Store::new(Arc::new(vault()), &dir).unwrap();
+    s.put("project", "a", b"file a").unwrap();
+    s.put("project", "b", b"file b").unwrap();
+    fs::copy(dir.join("project/a.enc"), dir.join("project/b.enc")).unwrap();
+    assert!(matches!(s.get("project", "b"), Err(Error::Damaged)));
+    assert_eq!(&s.get("project", "a").unwrap().unwrap()[..], b"file a");
+}
+
+#[test]
+fn an_older_copy_of_a_file_put_back_is_caught() {
+    let dir = tmp("rollback");
+    let store = Store::new(Arc::new(vault()), dir.join("sealed")).unwrap();
+    let mut efs = Efs::open(store.clone(), "project").unwrap();
+    efs.write("notes.txt", b"version 1", 1, false).unwrap();
+    efs.flush().unwrap();
+    let blob = fs::read_dir(dir.join("sealed/project")).unwrap().map(|e| e.unwrap().path()).find(|p| !p.ends_with("manifest.enc")).unwrap();
+    let old = fs::read(&blob).unwrap();
+    efs.write("notes.txt", b"version 2", 2, false).unwrap();
+    efs.flush().unwrap();
+    fs::write(&blob, old).unwrap();
+    let efs = Efs::open(store, "project").unwrap();
+    assert!(matches!(efs.read("notes.txt"), Err(Error::Damaged)));
+}
+
+#[test]
+fn the_project_list_is_sealed_after_login() {
+    use anoncode::supervisor::{Config, Manager};
+    let dir = tmp("sealedlist");
+    let base = dir.join(".anoncode");
+    // A plaintext list from before there was a login.
+    let projects = Projects::new(&base);
+    projects.create_from("Secret plans", vault()).unwrap();
+    assert!(base.join("projects/index.json").is_file());
+
+    let mut m = Manager::new(Config { root: dir.clone(), base: base.clone(), server_command: Vec::new() }).unwrap();
+    m.setup("one passphrase").unwrap();
+    assert!(!base.join("projects/index.json").exists(), "the plaintext list is gone");
+    let names: Vec<String> = m.list().unwrap().into_iter().map(|p| p.name).collect();
+    assert_eq!(names, ["Secret plans"]);
+    let mut found = false;
+    for e in walk(&base) {
+        found |= fs::read(&e).unwrap().windows(12).any(|w| w == b"Secret plans");
+    }
+    assert!(!found, "no file holds the name in the clear");
+    m.logout();
+    assert!(m.list().unwrap().is_empty(), "nothing is listed without the login");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() { out.extend(walk(&p)) } else { out.push(p) }
+    }
+    out
 }

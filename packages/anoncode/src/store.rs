@@ -5,8 +5,9 @@
 //! there is only ciphertext. Collection and record names are checked so
 //! none can leave the store's folder. Writes are atomic.
 //!
-//! New records are binary blobs; JSON envelopes written by the first
-//! AnonCode are still read.
+//! New records are binary blobs bound to their collection and id, so a
+//! record copied over another fails to open. Older unbound blobs and the
+//! first AnonCode's JSON envelopes are still read.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,11 @@ impl Store {
         let base = base.into();
         create_private_dir(&base)?;
         Ok(Store { vault, base })
+    }
+
+    /// Whether `vault` is the one these records are sealed under.
+    pub fn same_vault(&self, vault: &Arc<Vault>) -> bool {
+        Arc::ptr_eq(&self.vault, vault)
     }
 
     pub fn vault(&self) -> &Vault {
@@ -63,7 +69,7 @@ impl Store {
     pub fn put_with(&self, collection: &str, id: &str, data: &[u8], durable: bool) -> Result<()> {
         let path = self.record_path(collection, id)?;
         create_private_dir(path.parent().unwrap())?;
-        write_private_atomic(&path, &self.vault.seal(data)?, durable)?;
+        write_private_atomic(&path, &self.vault.seal_bound(&format!("{collection}/{id}"), data)?, durable)?;
         Ok(())
     }
 
@@ -75,7 +81,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        self.vault.open(&sealed).map(Some)
+        self.vault.open_bound(&format!("{collection}/{id}"), &sealed).map(Some)
     }
 
     pub fn put_json<T: Serialize>(&self, collection: &str, id: &str, value: &T) -> Result<()> {

@@ -73,6 +73,22 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     b.create(dir)
 }
 
+/// A real folder (not a link) owned by this user that no one else can
+/// read, write or enter.
+#[cfg(unix)]
+pub fn is_private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(dir) {
+        Ok(m) => m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.mode() & 0o077 == 0,
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_private_dir(dir: &Path) -> bool {
+    dir.is_dir()
+}
+
 /// A record or collection name that can't be a path: letters, digits, `_`,
 /// `.`, `-`; not starting with `.` or `-`; no `..`.
 pub fn safe_name(name: &str, kind: &str) -> Result<()> {

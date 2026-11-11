@@ -4,15 +4,13 @@
 //! folder under `.anoncode/projects/`, so projects are separated by
 //! cryptography and not just by folder.
 //!
-//! The index (`projects/index.json`) is not sealed: it holds project ids,
-//! display names and creation times, so the tab bar can be drawn before
-//! anything is unlocked. Names are therefore readable on disk; everything
-//! else is sealed.
+//! The list of projects (ids, names, creation times) is sealed in the app's
+//! vault once there is a login ([`Projects::seal_index`]); a plaintext
+//! `projects/index.json` from before is moved in there and deleted.
 //!
 //! ```text
 //! .anoncode/
 //!   projects/
-//!     index.json            names and ids (plaintext)
 //!     <id>/
 //!       vault.json          scrypt cost, salt, sealed check value
 //!       project/*.enc       the project's files, sealed
@@ -21,10 +19,11 @@
 //!         work/             the project's files (tools need real files)
 //! ```
 //!
-//! The agent's own data (its chat database, provider keys, settings) is
-//! plaintext only in memory while a project is unlocked: it is written out
-//! under `/dev/shm`, which is RAM, never under the folder on disk. Where
-//! there is no `/dev/shm` it goes in `run/` instead.
+//! The agent's own data (its chat database, settings, caches) is plaintext
+//! only in memory while a project is unlocked: it is written out under the
+//! user's runtime folder (`$XDG_RUNTIME_DIR`) or `/dev/shm`, both RAM,
+//! never under the folder on disk. Either is used only if it is a real
+//! folder owned by this user that no one else can enter.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -60,11 +59,36 @@ pub struct ProjectPaths {
 /// The registry, rooted at a `.anoncode` folder.
 pub struct Projects {
     base: PathBuf,
+    /// Where the list is kept once it is sealed.
+    sealed: Option<crate::store::Store>,
 }
 
 impl Projects {
     pub fn new(base: impl Into<PathBuf>) -> Projects {
-        Projects { base: base.into() }
+        Projects { base: base.into(), sealed: None }
+    }
+
+    /// Keeps the list sealed in `store` from now on, moving a plaintext
+    /// list from before into it.
+    pub fn seal_index(&mut self, store: crate::store::Store) -> Result<()> {
+        let plain = self.list()?;
+        self.sealed = Some(store);
+        if self.index_file().is_file() {
+            let mut list = self.list()?;
+            for p in plain {
+                if !list.iter().any(|q| q.id == p.id) {
+                    list.push(p);
+                }
+            }
+            self.write(&list)?;
+            fs::remove_file(self.index_file())?;
+        }
+        Ok(())
+    }
+
+    /// Back to the plaintext list (on logout nothing can be listed).
+    pub fn forget_index(&mut self) {
+        self.sealed = None;
     }
 
     pub fn base(&self) -> &Path {
@@ -80,6 +104,9 @@ impl Projects {
     }
 
     pub fn list(&self) -> Result<Vec<ProjectMeta>> {
+        if let Some(store) = &self.sealed {
+            return Ok(store.get_json("projects", "index")?.unwrap_or_default());
+        }
         match fs::read(self.index_file()) {
             Ok(b) => Ok(serde_json::from_slice(&b).unwrap_or_default()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -88,6 +115,9 @@ impl Projects {
     }
 
     fn write(&self, list: &[ProjectMeta]) -> Result<()> {
+        if let Some(store) = &self.sealed {
+            return store.put_json("projects", "index", &list.to_vec());
+        }
         create_private_dir(&self.dir())?;
         write_private_atomic(&self.index_file(), &serde_json::to_vec_pretty(list)?, true)?;
         Ok(())
@@ -108,6 +138,13 @@ impl Projects {
     /// Creates a project and its vault, locked to `passphrase`.
     pub fn create(&self, name: &str, passphrase: &str) -> Result<(ProjectMeta, Vault)> {
         let vault = Vault::create(passphrase)?;
+        self.create_from(name, vault)
+    }
+
+    /// A project locked to a random secret: the lowest Argon2id cost is
+    /// enough, since a 256-bit secret can't be guessed.
+    pub fn create_with_secret(&self, name: &str, secret: &str) -> Result<(ProjectMeta, Vault)> {
+        let vault = Vault::create_with(secret, crate::vault::KdfParams::for_random_secret(), true)?;
         self.create_from(name, vault)
     }
 
@@ -154,18 +191,33 @@ impl Projects {
     }
 }
 
-/// A folder in RAM for one project's unsealed agent data: under
-/// `/dev/shm`, owned by this user, named by a hash of the project's folder
-/// so two AnonCode folders never share one.
+/// A folder in RAM for one project's unsealed agent data, named by a hash
+/// of the project's folder so two AnonCode folders never share one.
+///
+/// It is under `$XDG_RUNTIME_DIR` (made by the system for this user alone)
+/// or else `/dev/shm/anoncode-<uid>`. Either is used only if it is a real
+/// folder, not a link, owned by this user, and closed to everyone else; a
+/// `/dev/shm` folder someone else made first is refused, not used.
 #[cfg(unix)]
 fn memory_dir(project: &Path) -> Option<PathBuf> {
-    let shm = Path::new("/dev/shm");
-    if !shm.is_dir() {
+    let name = crate::efs::sha256_hex(project.to_string_lossy().as_bytes());
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_absolute() && crate::fsx::is_private_dir(d));
+    let base = match runtime {
+        Some(d) => d.join("anoncode"),
+        None => {
+            let shm = Path::new("/dev/shm");
+            if !shm.is_dir() {
+                return None;
+            }
+            shm.join(format!("anoncode-{}", unsafe { libc::getuid() }))
+        }
+    };
+    // Made 0700 if missing; then checked, whoever made it.
+    let _ = create_private_dir(&base);
+    if !crate::fsx::is_private_dir(&base) {
         return None;
     }
-    let uid = unsafe { libc::getuid() };
-    let name = crate::efs::sha256_hex(project.to_string_lossy().as_bytes());
-    Some(shm.join(format!("anoncode-{uid}")).join(&name[..24]))
+    Some(base.join(&name[..24]))
 }
 
 #[cfg(not(unix))]
