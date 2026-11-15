@@ -420,6 +420,15 @@ fn request(tx: &Sender<Msg>, ctx: &egui::Context, id: &str, work: impl FnOnce() 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, manager: Manager) -> App {
         cc.egui_ctx.add_plugin(Selected::default());
+        // A signal only sets QUIT, and an idle window draws no frame to see
+        // it: wake the window so it closes (and locks everything).
+        let waker = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            while !QUIT.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            waker.request_repaint();
+        });
         let (tx, rx) = channel();
         let has_login = manager.has_login();
         App {
@@ -908,8 +917,8 @@ impl App {
             let field = ui.add(TextEdit::singleline(&mut self.new_name).hint_text("Name (shown on the tab, not encrypted)").desired_width(f32::INFINITY));
             edit_menu(&field, &mut self.new_name, false);
             let enter = field.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if !self.new_busy && self.new_name.is_empty() && !field.has_focus() {
-                field.request_focus();
+            if !self.new_busy && self.new_name.is_empty() {
+                focus_once(&field);
             }
             if !self.new_error.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.new_error);
@@ -955,8 +964,8 @@ impl App {
                 let again = ui.add_enabled(!self.login_busy, TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Passphrase again").desired_width(f32::INFINITY));
                 edit_menu(&again, &mut self.login_pass2, true);
                 enter = again.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            } else if !self.login_busy && self.login_pass.is_empty() && !first.has_focus() {
-                first.request_focus();
+            } else if !self.login_busy && self.login_pass.is_empty() {
+                focus_once(&first);
             }
             if !self.login_error.is_empty() {
                 ui.colored_label(ui.visuals().error_fg_color, &self.login_error);
@@ -1188,8 +1197,8 @@ impl App {
             let go = ui.add_enabled(!busy, egui::Button::new(if busy { "Unlocking…" } else { "Unlock" })).clicked();
             if busy {
                 ui.spinner();
-            } else if !field.has_focus() && self.pass.is_empty() {
-                field.request_focus();
+            } else if self.pass.is_empty() {
+                focus_once(&field);
             }
             if (go || enter || std::mem::take(&mut self.press_unlock)) && !busy && !self.pass.is_empty() {
                 self.busy.insert(project.id.clone());
@@ -1374,7 +1383,7 @@ impl App {
                                 .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)),
                         );
                         edit_menu(&edit, &mut tab.composer, false);
-                        let mut send = edit.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
+                        let mut send = ui.memory(|m| m.has_focus(edit.id)) && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                         ui.horizontal(|ui| {
                             if round_button(ui, Icon::Plus, true).on_hover_text("Attach files. You can also drop files on the window.").clicked() {
                                 pick(&tx, &ctx, &id, "Attach files", false);
@@ -1445,7 +1454,7 @@ impl App {
                 window("Rename project").open(&mut open).show(ctx, |ui| {
                     let r = ui.add(TextEdit::singleline(name).desired_width(280.0));
                     edit_menu(&r, name, false);
-                    r.request_focus();
+                    focus_once(&r);
                     let enter = ui.input(|i| i.key_pressed(Key::Enter));
                     if (ui.button("Rename").clicked() || enter) && !name.trim().is_empty() {
                         let (target, new_name) = (id.clone(), name.clone());
@@ -1981,6 +1990,19 @@ fn edit_menu(response: &egui::Response, text: &mut String, password: bool) {
     });
 }
 
+/// Puts the cursor in a field when nothing else has it.
+///
+/// Not `!response.has_focus()`: that is also false while the window itself
+/// is not focused, and some window managers never say it is. Asking for
+/// focus every frame resets the input method each time (egui interrupts
+/// it on every request), which loses key presses and keeps the window
+/// too busy to close.
+fn focus_once(response: &egui::Response) {
+    if response.ctx.memory(|m| m.focused().is_none()) {
+        response.request_focus();
+    }
+}
+
 /// Ctrl+A was pressed this frame.
 fn ctrl_a(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::A, pressed: true, modifiers, .. } if modifiers.ctrl || modifiers.command)))
@@ -2330,6 +2352,7 @@ mod selftest {
                 let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
                 eprintln!("selftest: clipboard: {clip:?}");
                 eprintln!("selftest: message box: {:?}", app.tabs.get(&id).map(|t| t.composer.clone()).unwrap_or_default());
+                eprintln!("selftest: passphrase box holds {} characters", app.login_pass.chars().count());
                 eprintln!("selftest: attachments: {:?}", app.tabs.get(&id).map(|t| t.attachments.clone()).unwrap_or_default());
                 eprintln!("selftest: scale {} pointer {:?} screen {:?}", ctx.pixels_per_point(), ctx.input(|i| i.pointer.latest_pos()), ctx.content_rect());
                 true
