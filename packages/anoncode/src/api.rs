@@ -144,6 +144,11 @@ impl Client {
         self.list("/api/command")
     }
 
+    /// Messages sent to a chat that the agent hasn't taken in yet.
+    pub fn inbox(&self, id: &str) -> ApiResult<Vec<Value>> {
+        self.list(&format!("/api/session/{id}/inbox"))
+    }
+
     pub fn interrupt(&self, id: &str) -> ApiResult<()> {
         self.call("POST", &format!("/api/session/{id}/interrupt"), None).map(|_| ())
     }

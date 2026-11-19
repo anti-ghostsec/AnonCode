@@ -413,3 +413,20 @@ fn tool_calls_written_as_text_are_left_out() {
     assert_eq!(tidy("a <tag> and | bars"), "a <tag> and | bars");
     assert_eq!(tidy("x <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>f<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜> y"), "x y");
 }
+
+#[test]
+fn sealing_many_files_is_quick() {
+    let dir = tmp("many");
+    let store = Store::new(Arc::new(vault()), dir.join("sealed")).unwrap();
+    let mut efs = Efs::open(store, "cache").unwrap();
+    let files = 11_000;
+    for i in 0..files {
+        efs.write(&format!("cargo/registry/f{i}.rs"), b"x", 1, false).unwrap();
+    }
+    let start = std::time::Instant::now();
+    efs.flush().unwrap();
+    // Each written file used to be checked against every file sealed: 121
+    // million hashes for a build cache this size.
+    assert!(start.elapsed() < std::time::Duration::from_secs(5), "took {:?}", start.elapsed());
+    assert_eq!(efs.paths().len(), files);
+}

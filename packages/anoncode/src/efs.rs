@@ -160,10 +160,15 @@ impl Efs {
             self.store.put_json(&self.collection, "manifest", &self.manifest)?;
             self.dirty = false;
         }
-        for id in std::mem::take(&mut self.doomed) {
-            // A path deleted and written again before this flush keeps its record.
-            let live = self.manifest.iter().any(|(p, e)| e.link.is_none() && self.blob_id(p) == id);
-            if !live {
+        let doomed = std::mem::take(&mut self.doomed);
+        if doomed.is_empty() {
+            return Ok(());
+        }
+        // A path deleted and written again before this flush keeps its record.
+        // Found once, not per record: a build cache has many thousands of files.
+        let live: std::collections::HashSet<String> = self.manifest.iter().filter(|(_, e)| e.link.is_none()).map(|(p, _)| self.blob_id(p)).collect();
+        for id in doomed {
+            if !live.contains(&id) {
                 self.store.remove(&self.collection, &id)?;
             }
         }

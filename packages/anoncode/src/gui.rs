@@ -43,6 +43,8 @@ enum Msg {
     Unlocked { id: String, error: Option<String> },
     Sessions { id: String, list: Vec<Value> },
     Messages { id: String, session: String, list: Vec<Value> },
+    /// Messages sent to the chat that the agent hasn't taken in yet.
+    Waiting { id: String, session: String, list: Vec<String> },
     /// Streamed text of a reply still being written.
     Delta { id: String, session: String, message: String, ordinal: u64, reasoning: bool, delta: String },
     Permissions { id: String, list: Vec<Value> },
@@ -79,6 +81,8 @@ struct Tab {
     /// Text streamed for reply parts not stored yet: `(message, ordinal)`
     /// to whether it is thinking, and the text so far.
     live: BTreeMap<(String, u64), (bool, String)>,
+    /// Sent, but the agent takes them in only at its next step.
+    waiting: Vec<String>,
     permissions: Vec<Value>,
     models: Vec<Value>,
     integrations: Vec<Value>,
@@ -281,6 +285,13 @@ fn poll(id: String, client: Client, shared: Arc<Shared>, tx: Sender<Msg>, ctx: e
                 Err(e) if round % 20 == 0 => send(Msg::Notice { id: id.clone(), text: format!("Could not read the chat: {e}") }),
                 Err(_) => {}
             }
+            if let Ok(items) = client.inbox(&session) {
+                let list: Vec<String> = items.iter().filter(|i| i["type"] == "user").map(|i| text(&i["payload"], "text")).collect();
+                let keyed: Vec<Value> = std::iter::once(Value::String(session.clone())).chain(list.iter().cloned().map(Value::String)).collect();
+                if changed("waiting", &keyed) {
+                    send(Msg::Waiting { id: id.clone(), session: session.clone(), list });
+                }
+            }
         }
         if let Ok(list) = client.permissions() {
             if changed("permissions", &list) {
@@ -365,6 +376,7 @@ impl Tab {
             sessions: Vec::new(),
             messages: Vec::new(),
             live: BTreeMap::new(),
+            waiting: Vec::new(),
             permissions: Vec::new(),
             models: Vec::new(),
             integrations: Vec::new(),
@@ -395,6 +407,7 @@ impl Tab {
         self.shared.wake.store(true, Ordering::SeqCst);
         self.messages.clear();
         self.live.clear();
+        self.waiting.clear();
         self.to_bottom = true;
         self.save_prefs();
     }
@@ -725,6 +738,13 @@ impl App {
                             };
                             let working = tab.working();
                             tab.live.retain(|(message, ordinal), _| working && !stored(message, *ordinal));
+                        }
+                    }
+                }
+                Msg::Waiting { id, session, list } => {
+                    if let Some(tab) = self.tabs.get_mut(&id) {
+                        if tab.session() == session {
+                            tab.waiting = list;
                         }
                     }
                 }
@@ -1316,6 +1336,14 @@ impl App {
                         if !tab.messages.iter().any(|m| m["id"] == mid.as_str()) {
                             live_part(ui, *reasoning, body);
                         }
+                    }
+                    for text in &tab.waiting {
+                        let weak = ui.visuals().weak_text_color();
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("You · waiting: the agent reads it at its next step").small().strong().color(weak));
+                            prose(ui, text);
+                        });
                     }
                     if to_bottom {
                         ui.scroll_to_cursor(Some(Align::BOTTOM));
@@ -2424,6 +2452,7 @@ mod selftest {
                     }
                     Some(tab) => {
                         if app.script.since.elapsed() > Duration::from_secs(2) {
+                            eprintln!("selftest: {} models ({}), {} integrations, notice: {}", tab.models.len(), tab.models.iter().take(3).map(|m| format!("{}/{}", text(m, "providerID"), text(m, "id"))).collect::<Vec<_>>().join(" "), tab.integrations.len(), tab.notice);
                             tab.shared.refresh.store(true, Ordering::SeqCst);
                             app.script.since = Instant::now();
                         }
