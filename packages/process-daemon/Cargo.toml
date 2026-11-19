@@ -43,3 +43,11 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_Console", "Win32_S
 codegen-units = 1
 lto = "thin"
 strip = "symbols"
+
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

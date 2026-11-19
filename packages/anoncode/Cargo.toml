@@ -50,5 +50,9 @@ strip = "symbols"
 # The KDF and the ciphers are unusably slow unoptimised.
 [profile.dev.package."*"]
 opt-level = 3
+debug = false
 [profile.dev]
 opt-level = 1
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes.
+debug = "line-tables-only"
