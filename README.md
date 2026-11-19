@@ -28,6 +28,11 @@ AnonCode is three things put together:
 The first run builds the app and installs the agent's dependencies. You need
 [Rust](https://rustup.rs), [Bun](https://bun.sh) 1.4 and bubblewrap (`apt install bubblewrap`).
 
+Or download a release: each `AnonCode-<version>-linux-x86_64.tar.gz` on the
+[releases page](https://github.com/anti-ghostsec/AnonCode/releases) has the app already built
+(x86_64 Linux), so only Bun and bubblewrap are needed. Unpack it and run `./anoncode` inside.
+A `v*` tag builds a release (`.github/workflows/release.yml`).
+
 - **You log in once.** The first run asks you to choose a passphrase; after that it is asked
   for when the app starts, and nothing else is.
 - **Projects are tabs** across the top, like a browser. `+` makes a new one; a closed project
