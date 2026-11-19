@@ -7,7 +7,8 @@ if [ ! -x "$bin" ] || [ -n "$(find "$root/packages/anoncode/src" "$root/packages
   echo "Building AnonCode..." >&2
   cargo build --release --manifest-path "$root/packages/anoncode/Cargo.toml"
 fi
-if [ ! -d "$root/node_modules" ]; then
+# Also when the folder is there but its files are gone: disk cleaners empty node_modules.
+if [ -z "$(find "$root/node_modules/.bun" -name package.json -print -quit 2>/dev/null)" ]; then
   echo "Installing the agent's dependencies..." >&2
   (cd "$root" && bun install --ignore-scripts)
 fi
