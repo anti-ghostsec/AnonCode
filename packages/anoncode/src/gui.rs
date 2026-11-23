@@ -93,6 +93,9 @@ struct Tab {
     /// Files to send with the next message.
     attachments: Vec<PathBuf>,
     notice: String,
+    /// How tall everything under the chat (questions, notice, message box)
+    /// was last frame, so the chat leaves room for all of it.
+    below: f32,
     to_bottom: bool,
     /// Pressed by the self-test script, as if Send had been clicked.
     press_send: bool,
@@ -385,6 +388,7 @@ impl Tab {
             composer: String::new(),
             attachments: Vec::new(),
             notice: String::new(),
+            below: 108.0,
             to_bottom: true,
             press_send: false,
             applied: saved["applied"].as_object().map(|o| o.iter().filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string()))).collect()).unwrap_or_default(),
@@ -1319,8 +1323,10 @@ impl App {
                 });
                 ui.separator();
 
-                let composer_height = 108.0 + if tab.attachments.is_empty() { 0.0 } else { 28.0 } + if tab.permissions.is_empty() { 0.0 } else { 64.0 } + if tab.notice.is_empty() { 0.0 } else { 40.0 };
-                let scroll = ScrollArea::vertical().id_salt("timeline").auto_shrink(false).max_height((ui.available_height() - composer_height).max(80.0)).stick_to_bottom(true);
+                // Room for what goes under the chat, as tall as it was last
+                // frame: the message box grows with its text (up to a limit).
+                let window_height = ui.available_height();
+                let scroll = ScrollArea::vertical().id_salt("timeline").auto_shrink(false).max_height((window_height - tab.below).max(80.0)).stick_to_bottom(true);
                 let to_bottom = std::mem::take(&mut tab.to_bottom);
                 scroll.show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -1350,16 +1356,21 @@ impl App {
                     }
                 });
 
-                // Waiting for a yes or no.
+                let below_top = ui.cursor().top();
+                // Waiting for a yes or no. This chat's question first, then
+                // any other: a helper agent the chat started asks from a
+                // chat of its own, and this one waits until it is answered.
                 let session = tab.session();
-                for p in tab.permissions.iter().filter(|p| p["sessionID"] == session.as_str()).take(1) {
+                let asking = tab.permissions.iter().find(|p| p["sessionID"] == session.as_str()).or(tab.permissions.first());
+                if let Some(p) = asking {
                     ui.group(|ui| {
                         let what = p["resources"].as_array().map(|r| r.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-                        ui.label(format!("The agent asks to: {} {}", text(p, "action"), clip(&what, 200)));
+                        let who = if p["sessionID"] == session.as_str() { "The agent" } else { "A helper agent" };
+                        ui.label(format!("{who} asks to: {} {}", text(p, "action"), clip(&what, 200)));
                         ui.horizontal(|ui| {
                             for (label, decision) in [("Allow once", "once"), ("Always allow", "always"), ("Deny", "reject")] {
                                 if ui.button(label).clicked() {
-                                    let (client, session, request_id) = (tab.client.clone(), session.clone(), text(p, "id"));
+                                    let (client, session, request_id) = (tab.client.clone(), text(p, "sessionID"), text(p, "id"));
                                     request(&tx, &ctx, &id, move || client.reply_permission(&session, &request_id, decision));
                                 }
                             }
@@ -1402,14 +1413,43 @@ impl App {
                                 }
                             });
                         }
-                        let edit = ui.add(
-                            TextEdit::multiline(&mut tab.composer)
-                                .hint_text("Ask anything. /loop and /focus are commands.")
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .frame(egui::Frame::NONE)
-                                .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)),
-                        );
+                        // Long text scrolls inside the box, which grows to at
+                        // most a third of the window, so the buttons and what
+                        // is being typed stay in view.
+                        let max_text = (window_height / 3.0).clamp(60.0, 320.0);
+                        let follow = egui::Id::unique(("composer-follow", &id));
+                        let edit = ScrollArea::vertical()
+                            .id_salt("composer")
+                            .max_height(max_text)
+                            .auto_shrink([false, true])
+                            // Typing at the end keeps the end in view.
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let out = TextEdit::multiline(&mut tab.composer)
+                                    .hint_text("Ask anything. /loop and /focus are commands.")
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .frame(egui::Frame::NONE)
+                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
+                                    .show(ui);
+                                // After a change (a paste above all) the cursor is
+                                // scrolled to for a few frames: in the first the box
+                                // doesn't know yet how tall the new text is.
+                                let mut left = ui.data(|d| d.get_temp::<u8>(follow)).unwrap_or(0);
+                                if out.response.changed() {
+                                    left = 3;
+                                }
+                                if left > 0 {
+                                    if let Some(range) = out.cursor_range {
+                                        let at = out.galley.pos_from_cursor(range.primary).translate(out.galley_pos.to_vec2());
+                                        ui.scroll_to_rect(at.expand(4.0), None);
+                                    }
+                                    ui.data_mut(|d| d.insert_temp(follow, left - 1));
+                                    ui.ctx().request_repaint();
+                                }
+                                out.response
+                            })
+                            .inner;
                         edit_menu(&edit, &mut tab.composer, false);
                         let mut send = ui.memory(|m| m.has_focus(edit.id)) && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
                         ui.horizontal(|ui| {
@@ -1430,6 +1470,11 @@ impl App {
                         send
                     })
                     .inner;
+                let below = ui.cursor().top() - below_top;
+                if (below - tab.below).abs() > 0.5 {
+                    tab.below = below;
+                    ui.ctx().request_repaint();
+                }
                 if (sent || std::mem::take(&mut tab.press_send)) && (!tab.composer.trim().is_empty() || !tab.attachments.is_empty()) {
                     let message = std::mem::take(&mut tab.composer).trim().to_string();
                     let command = message.strip_prefix('/').and_then(|rest| {
@@ -1760,9 +1805,13 @@ fn message(ui: &mut Ui, m: &Value, live: &BTreeMap<(String, u64), (bool, String)
             });
         }
         "shell" => {
-            egui::CollapsingHeader::new(RichText::new(format!("$ {}", clip(m["command"].as_str().unwrap_or(""), 90))).monospace().small()).id_salt("shell").show(ui, |ui| {
+            let command = m["command"].as_str().unwrap_or("");
+            egui::CollapsingHeader::new(RichText::new(format!("$ {}", clip(command, 90))).monospace().small()).id_salt("shell").show(ui, |ui| {
+                code_box(ui, command, command, true);
                 let output = m["output"]["output"].as_str().unwrap_or("");
-                copy_menu(ui.label(RichText::new(clip(output, 6000)).monospace().small()), output);
+                if !output.is_empty() {
+                    code_box(ui, &clip(output, 6000), output, true);
+                }
             });
         }
         "model-switched" => {
@@ -2069,16 +2118,57 @@ fn tool(ui: &mut Ui, index: usize, part: &Value) {
     let title = format!("{} {}  ({mark})", text(part, "name"), clip(hint, 80));
     let color = if status == "error" { ui.visuals().error_fg_color } else { ui.visuals().weak_text_color() };
     egui::CollapsingHeader::new(RichText::new(title).monospace().small().color(color)).id_salt(("tool", index)).show(ui, |ui| {
-        let pretty = serde_json::to_string_pretty(input).unwrap_or_default();
-        copy_menu(ui.label(RichText::new(clip(&pretty, 4000)).monospace().small()), &pretty);
+        // A command is shown (and copied) as itself, not as JSON with its
+        // quotes and line breaks escaped; the other arguments under it.
+        let mut rest = input.clone();
+        if let Some(command) = input["command"].as_str() {
+            code_box(ui, command, command, true);
+            if let Some(map) = rest.as_object_mut() {
+                map.remove("command");
+            }
+        }
+        if rest.as_object().is_none_or(|m| !m.is_empty()) {
+            let pretty = serde_json::to_string_pretty(&rest).unwrap_or_default();
+            code_box(ui, &clip(&pretty, 4000), &pretty, true);
+        }
         let output: String = state["content"].as_array().into_iter().flatten().filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n");
         if !output.is_empty() {
-            ui.separator();
-            copy_menu(ui.label(RichText::new(clip(&output, 6000)).monospace().small()), &output);
+            code_box(ui, &clip(&output, 6000), &output, true);
         }
         if let Some(error) = state["error"]["message"].as_str() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
+    });
+}
+
+/// A Copy button for `text`; it says "Copied" for a moment after a click.
+fn copy_button(ui: &mut Ui, text: &str) {
+    let id = ui.next_auto_id().with("copied");
+    let now = ui.input(|i| i.time);
+    let copied = ui.data(|d| d.get_temp::<f64>(id)).is_some_and(|at| now - at < 1.5);
+    if ui.small_button(if copied { "Copied" } else { "Copy" }).on_hover_text("Copy to the clipboard").clicked() {
+        ui.ctx().copy_text(text.to_string());
+        ui.data_mut(|d| d.insert_temp(id, now));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(1600));
+    }
+}
+
+/// Code, a command or a tool's output in a monospace box with a Copy
+/// button at its top right. `shown` is what is drawn (it may be clipped),
+/// `whole` what is copied.
+fn code_box(ui: &mut Ui, shown: &str, whole: &str, small: bool) {
+    egui::Frame::group(ui.style()).fill(ui.visuals().extreme_bg_color).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            copy_button(ui, whole);
+            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
+                let mut text = RichText::new(shown).monospace();
+                if small {
+                    text = text.small();
+                }
+                copy_menu(ui.add(egui::Label::new(text).wrap().selectable(true)), whole);
+            });
+        });
     });
 }
 
@@ -2089,10 +2179,7 @@ fn prose(ui: &mut Ui, body: &str) {
         if i % 2 == 1 {
             // The first line of a fence is its language.
             let code = chunk.split_once('\n').map(|(_, rest)| rest).unwrap_or(chunk).trim_end();
-            egui::Frame::group(ui.style()).fill(ui.visuals().extreme_bg_color).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                copy_menu(ui.add(egui::Label::new(RichText::new(code).monospace()).selectable(true)), code);
-            });
+            code_box(ui, code, code, false);
         } else if !chunk.trim().is_empty() {
             copy_menu(ui.add(egui::Label::new(inline(ui, chunk.trim_matches('\n'))).wrap().selectable(true)), body);
         }
@@ -2242,6 +2329,7 @@ pub fn run(cfg: Config) -> Result<()> {
 /// noprovider PROVIDER        in Settings, remove that provider's key
 /// model PROVIDER MODEL       wait for the model to be listed, then choose it
 /// attach PATH                attach a file to the next message
+/// fill TEXT                  put TEXT in the message box, not sent (\n: new line)
 /// say TEXT                   type TEXT and press Send
 /// idle                       wait until the agent's turn has ended
 /// sleep SECONDS
@@ -2324,20 +2412,27 @@ mod selftest {
                 true
             }
             "allow" => {
-                // Answer the first waiting permission request: once or reject.
+                // Answer the waiting permission request the window shows: once or reject.
                 let session = app.tabs.get(&id).map(|t| t.session()).unwrap_or_default();
                 let Some(tab) = app.tabs.get(&id) else { return };
-                let Some(p) = tab.permissions.iter().find(|p| p["sessionID"] == session.as_str()).cloned() else {
+                let Some(p) = tab.permissions.iter().find(|p| p["sessionID"] == session.as_str()).or(tab.permissions.first()).cloned() else {
                     app.script.started = false;
                     return;
                 };
-                let (client, request_id, decision) = (tab.client.clone(), text(&p, "id"), if rest == "no" { "reject" } else { "once" });
+                let (client, session, request_id, decision) = (tab.client.clone(), text(&p, "sessionID"), text(&p, "id"), if rest == "no" { "reject" } else { "once" });
                 eprintln!("selftest: answering {} {}", text(&p, "action"), decision);
                 request(&app.tx, &app.ctx, &id, move || client.reply_permission(&session, &request_id, decision));
                 true
             }
             "settings" => {
                 app.show_settings = true;
+                true
+            }
+            // fill TEXT: put TEXT in the message box without sending it; \n is a new line.
+            "fill" => {
+                if let Some(tab) = app.tabs.get_mut(&id) {
+                    tab.composer = rest.replace("\\n", "\n");
+                }
                 true
             }
             // mouse move|down|up|rdown|rup|click|rclick X Y, in points.
@@ -2411,8 +2506,9 @@ mod selftest {
                 let _ = arboard::Clipboard::new().and_then(|mut c| c.set_text(rest.to_string()));
                 true
             }
+            // type TEXT: as if typed into the box with the focus; \n is Enter's new line.
             "type" => {
-                app.script.events.push(egui::Event::Text(rest.to_string()));
+                app.script.events.push(egui::Event::Text(rest.replace("\\n", "\n")));
                 true
             }
             "noprovider" => {

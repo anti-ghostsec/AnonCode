@@ -13,8 +13,10 @@ AnonCode is three things put together:
 - **The app** (`packages/anoncode`, Rust) is the window you use and the vault underneath it.
   It is not a web page and has no browser in it.
 - **Plugins** (`packages/anoncode-plugins`) add the reviewer loop and FOCUS context
-  compression to the agent, take identifying headers out of model requests (`privacy`), and
-  take tool calls a model wrote out as text out of what it is sent back (`tidy`).
+  compression to the agent, take identifying headers out of model requests (`privacy`),
+  take tool calls a model wrote out as text out of what it is sent back (`tidy`), and stop
+  a shell command the agent waits on after 15 minutes at most, so one that never ends can't
+  hang the chat (`limits`).
 
 > Status: early. It runs and has been used against a real model, but parts of the interface
 > have only been exercised by a script. See "What's missing".

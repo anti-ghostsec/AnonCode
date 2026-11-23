@@ -437,7 +437,7 @@ impl Manager {
             }
         }
         path.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(String::from));
-        let plugins: Vec<String> = ["loop", "focus", "privacy", "tidy"]
+        let plugins: Vec<String> = ["loop", "focus", "privacy", "tidy", "limits"]
             .iter()
             .filter(|p| self.cfg.root.join("packages/anoncode-plugins").join(p).is_dir())
             .map(|p| code.join("packages/anoncode-plugins").join(p).to_string_lossy().into_owned())
