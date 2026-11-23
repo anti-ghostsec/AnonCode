@@ -30,8 +30,10 @@ The first run builds the app and installs the agent's dependencies. You need
 
 Or download a release: each `AnonCode-<version>-linux-x86_64.tar.gz` on the
 [releases page](https://github.com/anti-ghostsec/AnonCode/releases) has the app already built
-(x86_64 Linux), so only Bun and bubblewrap are needed. Unpack it and run `./anoncode` inside.
-A `v*` tag builds a release (`.github/workflows/release.yml`).
+(x86_64 Linux), its own Bun (`bin/bun`) and the agent's dependencies installed, so there is
+nothing to install but bubblewrap, which most desktops have. Unpack it and run `./anoncode`
+inside. A `v*` tag builds a release (`.github/workflows/release.yml`, which runs
+`script/package-release.sh`).
 
 - **You log in once.** The first run asks you to choose a passphrase; after that it is asked
   for when the app starts, and nothing else is.

@@ -427,6 +427,10 @@ impl Manager {
         };
         let tools: Vec<&str> = TOOLCHAINS.iter().copied().filter(|t| home_dir.join(t).exists()).collect();
         let mut path: Vec<String> = Vec::new();
+        // A release has its own Bun in bin/, first so it's the one used.
+        if self.cfg.root.join("bin/bun").is_file() {
+            path.push(code.join("bin").to_string_lossy().into_owned());
+        }
         for t in [".local/bin", ".cargo/bin", ".bun/bin"] {
             if tools.contains(&t) {
                 path.push(if sandboxed { format!("{SANDBOX_TOOLS}/{t}") } else { home_dir.join(t).to_string_lossy().into_owned() });

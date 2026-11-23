@@ -1,15 +1,36 @@
 #!/bin/sh
 # Starts AnonCode: builds the app the first time (or after its source changed), then opens its window.
+# A release has the app, Bun (bin/bun) and the agent's dependencies in it already, so it just starts.
 set -e
 root=$(cd "$(dirname "$0")" && pwd)
 bin="$root/packages/anoncode/target/release/anoncode"
-if [ ! -x "$bin" ] || [ -n "$(find "$root/packages/anoncode/src" "$root/packages/anoncode/Cargo.toml" -newer "$bin" -print -quit)" ]; then
+
+# Started from a menu there's no terminal to say why it didn't open: a window says it instead.
+fail() {
+  echo "AnonCode: $*" >&2
+  if [ ! -t 2 ]; then
+    if command -v zenity >/dev/null 2>&1; then zenity --error --title=AnonCode --text="$*" 2>/dev/null || true
+    elif command -v kdialog >/dev/null 2>&1; then kdialog --title AnonCode --error "$*" 2>/dev/null || true
+    elif command -v notify-send >/dev/null 2>&1; then notify-send AnonCode "$*" 2>/dev/null || true
+    fi
+  fi
+  exit 1
+}
+
+# Only a git checkout is rebuilt when its source changes: a release's binary is the one built from
+# its source (and an installer copying the folder can make the source look newer than it).
+if [ ! -x "$bin" ] || { [ -e "$root/.git" ] && [ -n "$(find "$root/packages/anoncode/src" "$root/packages/anoncode/Cargo.toml" -newer "$bin" -print -quit)" ]; }; then
+  command -v cargo >/dev/null 2>&1 || fail "The app isn't built and Rust (cargo) isn't installed to build it. Download a release instead: it is built already."
   echo "Building AnonCode..." >&2
-  cargo build --release --manifest-path "$root/packages/anoncode/Cargo.toml"
+  cargo build --release --manifest-path "$root/packages/anoncode/Cargo.toml" || fail "The app couldn't be built (see the output above)."
 fi
+
+# The Bun that came with it, otherwise one on PATH. The app looks in bin/ too.
+if [ -x "$root/bin/bun" ]; then bun="$root/bin/bun"; else bun=$(command -v bun) || fail "Bun isn't installed (https://bun.sh). A release has it already."; fi
+
 # Also when the folder is there but its files are gone: disk cleaners empty node_modules.
 if [ -z "$(find "$root/node_modules/.bun" -name package.json -print -quit 2>/dev/null)" ]; then
   echo "Installing the agent's dependencies..." >&2
-  (cd "$root" && bun install --ignore-scripts)
+  (cd "$root" && "$bun" install --ignore-scripts) || fail "The agent's dependencies couldn't be installed (see the output above)."
 fi
 ANONCODE_ROOT="$root" exec "$bin" "$@"

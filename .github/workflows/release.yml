@@ -1,7 +1,8 @@
 name: release
 
 # A v* tag builds the app for Linux and publishes it with the source it
-# was built from, ready to start with ./anoncode.
+# was built from, Bun and the agent's dependencies, ready to start with
+# ./anoncode.
 on:
   push:
     tags: ["v*"]
@@ -32,15 +33,8 @@ jobs:
         run: cargo build --release --locked
 
       - name: Package
-        run: |
-          name="AnonCode-${GITHUB_REF_NAME}-linux-x86_64"
-          git archive --format=tar --prefix="$name/" HEAD > "$name.tar"
-          # Built after the source's time, so ./anoncode uses it as it is.
-          mkdir -p "stage/$name/packages/anoncode/target/release"
-          cp packages/anoncode/target/release/anoncode "stage/$name/packages/anoncode/target/release/"
-          tar --append -f "$name.tar" -C stage "$name/packages/anoncode/target/release/anoncode"
-          gzip -9 "$name.tar"
-          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+        # With Bun and the agent's dependencies in it: nothing else to install.
+        run: sh script/package-release.sh "$GITHUB_REF_NAME" packages/anoncode/target/release/anoncode
 
       - name: Publish
         env:
